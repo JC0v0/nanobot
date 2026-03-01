@@ -1,5 +1,6 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import asyncio
 import json
 import json_repair
 import os
@@ -164,6 +165,55 @@ class LiteLLMProvider(LLMProvider):
             sanitized.append(clean)
         return sanitized
 
+    @staticmethod
+    def _is_token_limit_error(e: Exception) -> bool:
+        """Check if the error is a token limit error."""
+        error_str = str(e).lower()
+        token_error_patterns = [
+            "token",
+            "context length",
+            "context_length",
+            "max tokens",
+            "total tokens",
+            "exceed",
+            "too long",
+        ]
+        return any(pattern in error_str for pattern in token_error_patterns)
+
+    @staticmethod
+    def _truncate_messages_for_retry(messages: list[dict[str, Any]], keep_ratio: float = 0.7) -> list[dict[str, Any]]:
+        """
+        Truncate messages to fit within token limits.
+
+        Strategy:
+        - Always keep system message if present
+        - Keep the most recent messages (keep_ratio)
+        - Remove older messages
+        """
+        if len(messages) <= 2:
+            return messages  # Not enough messages to truncate
+
+        # Separate system message from others
+        system_msg = None
+        other_msgs = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_msg = msg
+            else:
+                other_msgs.append(msg)
+
+        # Calculate how many messages to keep
+        keep_count = max(1, int(len(other_msgs) * keep_ratio))
+        kept_msgs = other_msgs[-keep_count:]  # Keep most recent
+
+        # Reconstruct messages
+        result = []
+        if system_msg:
+            result.append(system_msg)
+        result.extend(kept_msgs)
+
+        return result
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -171,65 +221,125 @@ class LiteLLMProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        cancel_event: Any | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions in OpenAI format.
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
-        
+            cancel_event: Optional asyncio.Event to cancel the request.
+
         Returns:
             LLMResponse with content and/or tool calls.
         """
         original_model = model or self.default_model
         model = self._resolve_model(original_model)
 
-        if self._supports_cache_control(original_model):
-            messages, tools = self._apply_cache_control(messages, tools)
-
         # Clamp max_tokens to at least 1 — negative or zero values cause
         # LiteLLM to reject the request with "max_tokens must be at least 1".
         max_tokens = max(1, max_tokens)
-        
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
-        self._apply_model_overrides(model, kwargs)
-        
-        # Pass api_key directly — more reliable than env vars alone
-        if self.api_key:
-            kwargs["api_key"] = self.api_key
-        
-        # Pass api_base for custom endpoints
-        if self.api_base:
-            kwargs["api_base"] = self.api_base
-        
-        # Pass extra headers (e.g. APP-Code for AiHubMix)
-        if self.extra_headers:
-            kwargs["extra_headers"] = self.extra_headers
-        
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-        
-        try:
-            response = await acompletion(**kwargs)
-            return self._parse_response(response)
-        except Exception as e:
-            # Return error as content for graceful handling
-            return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
-            )
+
+        # Retry logic for token limit errors
+        max_retries = 3
+        retry_count = 0
+        current_messages = list(messages)  # Make a copy for potential truncation
+
+        while retry_count < max_retries:
+            if self._supports_cache_control(original_model):
+                # Re-apply cache control on each retry (since messages may change)
+                cached_messages, cached_tools = self._apply_cache_control(current_messages, tools)
+            else:
+                cached_messages = current_messages
+                cached_tools = tools
+
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": self._sanitize_messages(self._sanitize_empty_content(cached_messages)),
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+
+            # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
+            self._apply_model_overrides(model, kwargs)
+
+            # Pass api_key directly — more reliable than env vars alone
+            if self.api_key:
+                kwargs["api_key"] = self.api_key
+
+            # Pass api_base for custom endpoints
+            if self.api_base:
+                kwargs["api_base"] = self.api_base
+
+            # Pass extra headers (e.g. APP-Code for AiHubMix)
+            if self.extra_headers:
+                kwargs["extra_headers"] = self.extra_headers
+
+            if cached_tools:
+                kwargs["tools"] = cached_tools
+                kwargs["tool_choice"] = "auto"
+
+            try:
+                # Check for cancellation before starting
+                if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
+                    raise asyncio.CancelledError()
+
+                # Create the completion task
+                completion_task = asyncio.create_task(acompletion(**kwargs))
+
+                if cancel_event and hasattr(cancel_event, "wait"):
+                    # Wait for either completion or cancellation
+                    done, pending = await asyncio.wait(
+                        [completion_task, asyncio.create_task(cancel_event.wait())],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    if hasattr(cancel_event, "is_set") and cancel_event.is_set():
+                        completion_task.cancel()
+                        # Try to wait for cancellation
+                        try:
+                            await completion_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise asyncio.CancelledError()
+
+                    response = completion_task.result()
+                else:
+                    response = await completion_task
+
+                return self._parse_response(response)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Check if this is a token limit error that we can retry
+                if self._is_token_limit_error(e) and retry_count < max_retries - 1:
+                    retry_count += 1
+                    keep_ratio = 0.7 - (retry_count * 0.15)  # 0.7, 0.55, 0.4
+
+                    from loguru import logger
+                    logger.warning(
+                        f"Token limit exceeded (attempt {retry_count}/{max_retries}), "
+                        f"truncating context to {keep_ratio:.0%} and retrying..."
+                    )
+
+                    # Truncate messages for next retry
+                    current_messages = self._truncate_messages_for_retry(current_messages, keep_ratio)
+                    continue
+
+                # For other errors or if we've exhausted retries, return error gracefully
+                from loguru import logger
+                logger.error(f"LLM call failed after {retry_count} retries: {e}")
+
+                # Return error as content for graceful handling
+                return LLMResponse(
+                    content=f"Error calling LLM: {str(e)}",
+                    finish_reason="error",
+                )
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

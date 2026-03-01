@@ -14,6 +14,7 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.task_store import TaskProgress, TaskState, TaskStore
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -99,6 +100,11 @@ class AgentLoop:
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
+        # Session processing state for interruptible handling
+        self._session_tasks: dict[str, asyncio.Task] = {}  # session_key -> Task
+        self._session_cancel_events: dict[str, asyncio.Event] = {}  # session_key -> Event
+        # Task persistence
+        self._task_store = TaskStore(workspace / "tasks" / "tasks.jsonl")
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -175,6 +181,8 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        cancel_event: asyncio.Event | None = None,
+        session_key: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
@@ -183,7 +191,21 @@ class AgentLoop:
         tools_used: list[str] = []
 
         while iteration < self.max_iterations:
+            # Check for cancellation before each iteration
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError()
+
             iteration += 1
+
+            # Update task progress
+            if session_key:
+                self._update_task_progress(
+                    session_key,
+                    TaskProgress.WAITING_LLM,
+                    messages=messages,
+                    current_iteration=iteration,
+                    tools_used=tools_used,
+                )
 
             response = await self.provider.chat(
                 messages=messages,
@@ -191,6 +213,7 @@ class AgentLoop:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
+                cancel_event=cancel_event,
             )
 
             if response.has_tool_calls:
@@ -217,9 +240,23 @@ class AgentLoop:
                 )
 
                 for tool_call in response.tool_calls:
+                    # Check for cancellation before each tool call
+                    if cancel_event and cancel_event.is_set():
+                        raise asyncio.CancelledError()
+
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+
+                    # Update task progress for tool execution
+                    if session_key:
+                        self._update_task_progress(
+                            session_key,
+                            TaskProgress.EXECUTING_TOOL,
+                            current_tool=tool_call.name,
+                            current_tool_args=tool_call.arguments,
+                        )
+
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
@@ -243,27 +280,17 @@ class AgentLoop:
         await self._connect_mcp()
         logger.info("Agent loop started")
 
+        # Recover pending tasks on startup
+        await self._recover_pending_tasks()
+
         while self._running:
             try:
                 msg = await asyncio.wait_for(
                     self.bus.consume_inbound(),
                     timeout=1.0
                 )
-                try:
-                    response = await self._process_message(msg)
-                    if response is not None:
-                        await self.bus.publish_outbound(response)
-                    elif msg.channel == "cli":
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id, content="", metadata=msg.metadata or {},
-                        ))
-                except Exception as e:
-                    logger.error("Error processing message: {}", e)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
-                    ))
+                # Handle message in background task to allow interruptions
+                asyncio.create_task(self._handle_incoming_message(msg))
             except asyncio.TimeoutError:
                 continue
 
@@ -457,3 +484,393 @@ class AgentLoop:
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""
+
+    # ===== Interruptible message handling methods =====
+
+    def _add_user_message_to_session(self, session: Session, msg: InboundMessage) -> None:
+        """Add a user message to the session without processing it."""
+        from datetime import datetime
+        entry = {
+            "role": "user",
+            "content": msg.content,
+            "timestamp": datetime.now().isoformat(),
+        }
+        if msg.media:
+            entry["media"] = msg.media
+        session.messages.append(entry)
+        session.updated_at = datetime.now()
+
+    async def _send_interruption_notice(self, msg: InboundMessage) -> None:
+        """Send an interruption notice to the user."""
+        notice = OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="收到新消息，重新思考...",
+            metadata=dict(msg.metadata or {})
+        )
+        await self.bus.publish_outbound(notice)
+
+    async def _process_system_message(self, msg: InboundMessage) -> None:
+        """Process a system message (keeps original logic)."""
+        channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
+                            else ("cli", msg.chat_id))
+        logger.info("Processing system message from {}", msg.sender_id)
+        key = f"{channel}:{chat_id}"
+        session = self.sessions.get_or_create(key)
+        self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+        history = session.get_history(max_messages=self.memory_window)
+        messages = self.context.build_messages(
+            history=history,
+            current_message=msg.content, channel=channel, chat_id=chat_id,
+        )
+        final_content, _, all_msgs = await self._run_agent_loop(messages)
+        self._save_turn(session, all_msgs, 1 + len(history))
+        self.sessions.save(session)
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=channel, chat_id=chat_id,
+            content=final_content or "Background task completed."
+        ))
+
+    async def _handle_incoming_message(self, msg: InboundMessage) -> None:
+        """
+        Handle an incoming message: add to session immediately,
+        interrupt ongoing processing, and start new processing.
+        """
+        session_key = msg.session_key
+
+        # System messages get special handling
+        if msg.channel == "system":
+            await self._process_system_message(msg)
+            return
+
+        # 1. Get or create session, add user message immediately
+        session = self.sessions.get_or_create(session_key)
+        self._add_user_message_to_session(session, msg)
+        self.sessions.save(session)
+
+        # 2. Create persistent task
+        self._task_store.create_task(
+            session_key,
+            last_inbound=self._inbound_to_dict(msg),
+        )
+        self._update_task_progress(session_key, TaskProgress.PENDING)
+
+        # 3. Check if there's ongoing processing for this session
+        if session_key in self._session_tasks:
+            logger.info(f"Interrupting ongoing processing for session {session_key}")
+
+            # Send interruption notice
+            await self._send_interruption_notice(msg)
+
+            # Cancel the old task
+            old_task = self._session_tasks[session_key]
+            cancel_event = self._session_cancel_events.get(session_key)
+
+            if cancel_event:
+                cancel_event.set()
+
+            old_task.cancel()
+            try:
+                await old_task
+            except asyncio.CancelledError:
+                pass  # Expected cancellation
+            except Exception as e:
+                logger.error(f"Error in cancelled task: {e}")
+
+        # 4. Create new cancel event
+        cancel_event = asyncio.Event()
+        self._session_cancel_events[session_key] = cancel_event
+
+        # 5. Start new processing task
+        task = asyncio.create_task(
+            self._process_session_task(session_key, msg, cancel_event)
+        )
+        self._session_tasks[session_key] = task
+
+    async def _process_session_task(
+        self,
+        session_key: str,
+        msg: InboundMessage,
+        cancel_event: asyncio.Event
+    ) -> None:
+        """Process a single session task with cancellation support."""
+        try:
+            # Check if already cancelled
+            if cancel_event.is_set():
+                return
+
+            session = self.sessions.get_or_create(session_key)
+
+            # Update task progress
+            self._update_task_progress(session_key, TaskProgress.BUILDING_CONTEXT)
+
+            # Process single turn with cancellation support
+            response = await self._process_single_turn(
+                session,
+                msg,
+                cancel_event=cancel_event
+            )
+
+            # Check cancellation again before sending response
+            if cancel_event.is_set():
+                return
+
+            if response:
+                await self.bus.publish_outbound(response)
+            elif msg.channel == "cli":
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content="",
+                    metadata=msg.metadata or {},
+                ))
+
+            # Task completed successfully
+            self._task_store.complete_task(session_key)
+
+        except asyncio.CancelledError:
+            logger.info(f"Session task cancelled for {session_key}")
+            # Don't complete the task - leave it for recovery
+            raise
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+            self._task_store.fail_task(session_key)
+            try:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Sorry, I encountered an error: {str(e)}"
+                ))
+            except Exception:
+                pass
+        finally:
+            # Clean up state only if we're still the current task
+            current_task = self._session_tasks.get(session_key)
+            if current_task == asyncio.current_task():
+                self._session_tasks.pop(session_key, None)
+                self._session_cancel_events.pop(session_key, None)
+
+    async def _process_single_turn(
+        self,
+        session: Session,
+        msg: InboundMessage,
+        cancel_event: asyncio.Event | None = None,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> OutboundMessage | None:
+        """
+        Process a single turn of conversation (without adding the user message).
+        Supports cancellation via cancel_event.
+        """
+        session_key = session.key
+
+        # Check for cancellation at start
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError()
+
+        # Slash commands
+        cmd = msg.content.strip().lower()
+        if cmd == "/new":
+            lock = self._get_consolidation_lock(session.key)
+            self._consolidating.add(session.key)
+            try:
+                async with lock:
+                    snapshot = session.messages[session.last_consolidated:]
+                    if snapshot:
+                        temp = Session(key=session.key)
+                        temp.messages = list(snapshot)
+                        if not await self._consolidate_memory(temp, archive_all=True):
+                            return OutboundMessage(
+                                channel=msg.channel, chat_id=msg.chat_id,
+                                content="Memory archival failed, session not cleared. Please try again.",
+                            )
+            except Exception:
+                logger.exception("/new archival failed for {}", session.key)
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Memory archival failed, session not cleared. Please try again.",
+                )
+            finally:
+                self._consolidating.discard(session.key)
+                self._prune_consolidation_lock(session.key, lock)
+
+            session.clear()
+            self.sessions.save(session)
+            self.sessions.invalidate(session.key)
+            self._task_store.complete_task(session_key)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="New session started.")
+        if cmd == "/help":
+            self._task_store.complete_task(session_key)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
+
+        # Check cancellation after command handling
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError()
+
+        unconsolidated = len(session.messages) - session.last_consolidated
+        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
+            self._consolidating.add(session.key)
+            lock = self._get_consolidation_lock(session.key)
+
+            async def _consolidate_and_unlock():
+                try:
+                    async with lock:
+                        await self._consolidate_memory(session)
+                finally:
+                    self._consolidating.discard(session.key)
+                    self._prune_consolidation_lock(session.key, lock)
+                    _task = asyncio.current_task()
+                    if _task is not None:
+                        self._consolidation_tasks.discard(_task)
+
+            _task = asyncio.create_task(_consolidate_and_unlock())
+            self._consolidation_tasks.add(_task)
+
+        # Check cancellation before building context
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError()
+
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        if message_tool := self.tools.get("message"):
+            if isinstance(message_tool, MessageTool):
+                message_tool.start_turn()
+
+        history = session.get_history(max_messages=self.memory_window)
+
+        # Update task progress
+        self._update_task_progress(session_key, TaskProgress.BUILDING_CONTEXT)
+
+        initial_messages = self.context.build_messages(
+            history=history,
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel, chat_id=msg.chat_id,
+        )
+
+        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_tool_hint"] = tool_hint
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+            ))
+
+        # Check cancellation before agent loop
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError()
+
+        # Update task progress
+        self._update_task_progress(session_key, TaskProgress.AGENT_LOOP)
+
+        final_content, tools_used, all_msgs = await self._run_agent_loop(
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            cancel_event=cancel_event,
+            session_key=session_key,
+        )
+
+        # Check cancellation after agent loop
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError()
+
+        if final_content is None:
+            final_content = "I've completed processing but have no response to give."
+
+        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+        self._save_turn(session, all_msgs, 1 + len(history))
+        self.sessions.save(session)
+
+        if message_tool := self.tools.get("message"):
+            if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+                return None
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+            metadata=msg.metadata or {},
+        )
+
+    # ===== Task persistence and recovery methods =====
+
+    async def _recover_pending_tasks(self) -> None:
+        """Recover pending tasks on startup."""
+        pending_tasks = self._task_store.get_pending_tasks()
+        if not pending_tasks:
+            return
+
+        logger.info("Recovering {} pending tasks", len(pending_tasks))
+
+        for task in pending_tasks:
+            asyncio.create_task(self._recover_task(task))
+
+    async def _recover_task(self, task: TaskState) -> None:
+        """Recover a single pending task."""
+        if not task.last_inbound:
+            logger.warning("Task {} has no last_inbound, removing", task.task_id)
+            self._task_store.remove_task(task.session_key)
+            return
+
+        # Reconstruct InboundMessage
+        last_inbound = task.last_inbound
+        msg = InboundMessage(
+            channel=last_inbound.get("channel", "cli"),
+            sender_id=last_inbound.get("sender_id", "user"),
+            chat_id=last_inbound.get("chat_id", "direct"),
+            content=last_inbound.get("content", ""),
+            media=last_inbound.get("media"),
+            metadata=last_inbound.get("metadata", {}),
+        )
+
+        # Send recovery notice
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content="检测到未完成任务，正在恢复...",
+            metadata=dict(msg.metadata or {}),
+        ))
+
+        # Process the task
+        session_key = task.session_key
+        session = self.sessions.get_or_create(session_key)
+
+        # Create cancel event
+        cancel_event = asyncio.Event()
+        self._session_cancel_events[session_key] = cancel_event
+
+        # Start recovery task
+        recovery_task = asyncio.create_task(
+            self._process_session_task(session_key, msg, cancel_event)
+        )
+        self._session_tasks[session_key] = recovery_task
+
+    def _inbound_to_dict(self, msg: InboundMessage) -> dict[str, Any]:
+        """Convert InboundMessage to a serializable dict."""
+        return {
+            "channel": msg.channel,
+            "sender_id": msg.sender_id,
+            "chat_id": msg.chat_id,
+            "content": msg.content,
+            "media": msg.media,
+            "metadata": msg.metadata,
+        }
+
+    def _update_task_progress(
+        self,
+        session_key: str,
+        progress: TaskProgress,
+        messages: list[dict[str, Any]] | None = None,
+        current_iteration: int | None = None,
+        tools_used: list[str] | None = None,
+        current_tool: str | None = None,
+        current_tool_args: dict[str, Any] | None = None,
+    ) -> None:
+        """Update task progress in the store."""
+        self._task_store.update_task(
+            session_key,
+            progress=progress,
+            messages=messages,
+            current_iteration=current_iteration,
+            tools_used=tools_used,
+            current_tool=current_tool,
+            current_tool_args=current_tool_args,
+        )

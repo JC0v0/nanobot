@@ -31,9 +31,14 @@ class OpenAICodexProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        cancel_event: Any | None = None,
     ) -> LLMResponse:
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
+
+        # Check for cancellation before starting
+        if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
+            raise asyncio.CancelledError()
 
         token = await asyncio.to_thread(get_codex_token)
         headers = _build_headers(token.account_id, token.access)
@@ -58,17 +63,23 @@ class OpenAICodexProvider(LLMProvider):
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                content, tool_calls, finish_reason = await _request_codex(
+                    url, headers, body, verify=True, cancel_event=cancel_event
+                )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
+                content, tool_calls, finish_reason = await _request_codex(
+                    url, headers, body, verify=False, cancel_event=cancel_event
+                )
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
                 finish_reason=finish_reason,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return LLMResponse(
                 content=f"Error calling Codex: {str(e)}",
@@ -102,13 +113,43 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
+    cancel_event: Any | None = None,
 ) -> tuple[str, list[ToolCallRequest], str]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
-        async with client.stream("POST", url, headers=headers, json=body) as response:
+        request = client.build_request("POST", url, headers=headers, json=body)
+
+        # Create the send task
+        send_task = asyncio.create_task(client.send(request, stream=True))
+
+        if cancel_event and hasattr(cancel_event, "wait"):
+            # Wait for either response or cancellation
+            done, pending = await asyncio.wait(
+                [send_task, asyncio.create_task(cancel_event.wait())],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if hasattr(cancel_event, "is_set") and cancel_event.is_set():
+                send_task.cancel()
+                try:
+                    await send_task
+                except asyncio.CancelledError:
+                    pass
+                raise asyncio.CancelledError()
+
+            response = send_task.result()
+        else:
+            response = await send_task
+
+        async with response:
             if response.status_code != 200:
                 text = await response.aread()
                 raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
-            return await _consume_sse(response)
+
+            # Check cancellation before consuming SSE
+            if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
+                raise asyncio.CancelledError()
+
+            return await _consume_sse(response, cancel_event=cancel_event)
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -242,13 +283,20 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
         buffer.append(line)
 
 
-async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str]:
+async def _consume_sse(
+    response: httpx.Response,
+    cancel_event: Any | None = None,
+) -> tuple[str, list[ToolCallRequest], str]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
     finish_reason = "stop"
 
     async for event in _iter_sse(response):
+        # Check cancellation periodically
+        if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
+            raise asyncio.CancelledError()
+
         event_type = event.get("type")
         if event_type == "response.output_item.added":
             item = event.get("item") or {}
