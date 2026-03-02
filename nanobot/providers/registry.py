@@ -141,7 +141,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(),
     ),
 
-    # VolcEngine (火山引擎): OpenAI-compatible gateway
+    # VolcEngine (火山引擎): OpenAI-compatible gateway, direct provider
     ProviderSpec(
         name="volcengine",
         keywords=("volcengine", "volces", "ark"),
@@ -157,6 +157,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.cn-beijing.volces.com/api/v3",
         strip_model_prefix=False,
         model_overrides=(),
+        is_direct=True,
     ),
 
     # === Standard providers (matched by model-name keywords) ===============

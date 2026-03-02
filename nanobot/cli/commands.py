@@ -234,6 +234,7 @@ def _make_provider(config: Config):
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.openai_codex_provider import OpenAICodexProvider
     from nanobot.providers.custom_provider import CustomProvider
+    from nanobot.providers.volcengine_provider import VolcEngineProvider
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
@@ -248,6 +249,14 @@ def _make_provider(config: Config):
         return CustomProvider(
             api_key=p.api_key if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
+            default_model=model,
+        )
+
+    # VolcEngine (火山引擎): direct OpenAI-compatible endpoint, bypasses LiteLLM
+    if provider_name == "volcengine":
+        return VolcEngineProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=config.get_api_base(model) or "https://ark.cn-beijing.volces.com/api/v3",
             default_model=model,
         )
 
