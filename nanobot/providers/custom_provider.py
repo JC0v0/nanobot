@@ -56,7 +56,12 @@ class CustomProvider(LLMProvider):
                         pass
                     raise asyncio.CancelledError()
 
-                response = completion_task.result()
+                # Get response from the completed task
+                if completion_task in done:
+                    response = completion_task.result()
+                else:
+                    # Should not reach here if cancel_event check works correctly
+                    response = await completion_task
             else:
                 response = await completion_task
 
