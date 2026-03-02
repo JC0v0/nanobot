@@ -103,7 +103,9 @@ class VolcEngineProvider(LLMProvider):
             }
             content = msg.get("content")
             if content is not None:
-                input_item["content"] = self._convert_content(content)
+                converted_content = self._convert_content(content)
+                if converted_content:
+                    input_item["content"] = converted_content
 
             # Handle tool calls in assistant messages
             tool_calls = msg.get("tool_calls")
@@ -126,7 +128,14 @@ class VolcEngineProvider(LLMProvider):
         return result
 
     def _convert_content(self, content: Any) -> Any:
-        """Convert OpenAI format content to Responses API format."""
+        """Convert OpenAI format content to Responses API format.
+
+        Following VolcEngine Responses API specification:
+        - input_text: 文本输入
+        - input_image: 图片输入
+        - input_video: 视频输入
+        - input_file: 文件输入
+        """
         if isinstance(content, str):
             return content
 
@@ -135,32 +144,82 @@ class VolcEngineProvider(LLMProvider):
             for item in content:
                 if isinstance(item, dict):
                     item_type = item.get("type")
+
+                    # OpenAI text format -> Responses API input_text
                     if item_type == "text":
-                        # Convert to input_text
                         result.append({
                             "type": "input_text",
                             "text": item.get("text", ""),
                         })
+
+                    # OpenAI image_url format -> Responses API input_image
                     elif item_type == "image_url":
-                        # Convert to input_image
                         image_url = item.get("image_url", {})
                         if isinstance(image_url, dict):
                             url = image_url.get("url", "")
-                            result.append({
+                            detail = image_url.get("detail", "high")
+                            image_item: dict[str, Any] = {
                                 "type": "input_image",
                                 "image_url": url,
-                            })
+                            }
+                            if detail:
+                                image_item["detail"] = detail
+                            result.append(image_item)
                         else:
                             result.append({
                                 "type": "input_image",
                                 "image_url": image_url,
                             })
+
+                    # OpenAI video_url format -> Responses API input_video
+                    elif item_type == "video_url":
+                        video_url = item.get("video_url", {})
+                        if isinstance(video_url, dict):
+                            url = video_url.get("url", "")
+                            fps = video_url.get("fps")
+                            video_item: dict[str, Any] = {
+                                "type": "input_video",
+                                "video_url": url,
+                            }
+                            if fps:
+                                video_item["fps"] = fps
+                            result.append(video_item)
+                        else:
+                            result.append({
+                                "type": "input_video",
+                                "video_url": video_url,
+                            })
+
+                    # Already in Responses API format - pass through
                     elif item_type in ("input_text", "input_image", "input_video", "input_file"):
-                        # Already in Responses API format, pass through
                         result.append(item)
+
+                    # OpenAI file format -> Responses API input_file
+                    elif item_type == "file" or item_type == "input_file":
+                        file_url = item.get("file_url", item.get("url", ""))
+                        file_data = item.get("file_data", item.get("data", ""))
+                        file_item: dict[str, Any] = {
+                            "type": "input_file",
+                        }
+                        if file_url:
+                            file_item["file_url"] = file_url
+                        if file_data:
+                            file_item["file_data"] = file_data
+                        filename = item.get("filename")
+                        if filename:
+                            file_item["filename"] = filename
+                        result.append(file_item)
+
+                    # Unknown type - try to extract text or skip
                     else:
-                        # Keep unknown types as-is
-                        result.append(item)
+                        text = item.get("text", item.get("content", ""))
+                        if text:
+                            result.append({
+                                "type": "input_text",
+                                "text": text,
+                            })
+                        # Skip unknown types to avoid API errors
+
                 else:
                     result.append(item)
             return result
