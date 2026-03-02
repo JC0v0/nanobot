@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import json_repair
@@ -29,7 +30,39 @@ class VolcEngineProvider(LLMProvider):
         if tools:
             kwargs.update(tools=tools, tool_choice="auto")
         try:
-            return self._parse(await self._client.chat.completions.create(**kwargs))
+            # Check for cancellation before starting
+            if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
+                raise asyncio.CancelledError()
+
+            # Create the completion task
+            completion_task = asyncio.create_task(self._client.chat.completions.create(**kwargs))
+
+            if cancel_event and hasattr(cancel_event, "wait"):
+                # Wait for either completion or cancellation
+                done, pending = await asyncio.wait(
+                    [completion_task, asyncio.create_task(cancel_event.wait())],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                # Clean up pending tasks
+                for task in pending:
+                    task.cancel()
+
+                if hasattr(cancel_event, "is_set") and cancel_event.is_set():
+                    completion_task.cancel()
+                    # Try to wait for cancellation
+                    try:
+                        await completion_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise asyncio.CancelledError()
+
+                response = completion_task.result()
+            else:
+                response = await completion_task
+
+            return self._parse(response)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return LLMResponse(content=f"Error: {e}", finish_reason="error")
 
