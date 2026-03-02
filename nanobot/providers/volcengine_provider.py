@@ -85,32 +85,87 @@ class VolcEngineProvider(LLMProvider):
         sanitized = self._sanitize_empty_content(messages)
         result = []
         for msg in sanitized:
+            # Handle tool responses first
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id and msg.get("role") == "tool":
+                content = msg.get("content")
+                result.append({
+                    "type": "function_call_output",
+                    "call_id": tool_call_id,
+                    "output": content if isinstance(content, str) else str(content),
+                })
+                continue
+
+            # Handle regular messages
             input_item = {
                 "type": "message",
                 "role": msg.get("role", "user"),
             }
             content = msg.get("content")
             if content is not None:
-                input_item["content"] = content
+                input_item["content"] = self._convert_content(content)
 
-            # Handle tool calls
+            # Handle tool calls in assistant messages
             tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                # For assistant messages with tool calls, we need to add them separately
-                # This is simplified - full implementation would need more handling
-                pass
-
-            # Handle tool responses
-            tool_call_id = msg.get("tool_call_id")
-            if tool_call_id and msg.get("role") == "tool":
-                result.append({
-                    "type": "function_call_output",
-                    "call_id": tool_call_id,
-                    "output": content if isinstance(content, str) else str(content),
-                })
+            if tool_calls and msg.get("role") == "assistant":
+                # Add function_call items for each tool call
+                for tc in tool_calls:
+                    if tc.get("type") == "function":
+                        func = tc.get("function", {})
+                        result.append({
+                            "type": "function_call",
+                            "call_id": tc.get("id", ""),
+                            "name": func.get("name", ""),
+                            "arguments": func.get("arguments", "{}"),
+                        })
+                # Also add the message if it has content
+                if input_item.get("content"):
+                    result.append(input_item)
             else:
                 result.append(input_item)
         return result
+
+    def _convert_content(self, content: Any) -> Any:
+        """Convert OpenAI format content to Responses API format."""
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            result = []
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = item.get("type")
+                    if item_type == "text":
+                        # Convert to input_text
+                        result.append({
+                            "type": "input_text",
+                            "text": item.get("text", ""),
+                        })
+                    elif item_type == "image_url":
+                        # Convert to input_image
+                        image_url = item.get("image_url", {})
+                        if isinstance(image_url, dict):
+                            url = image_url.get("url", "")
+                            result.append({
+                                "type": "input_image",
+                                "image_url": url,
+                            })
+                        else:
+                            result.append({
+                                "type": "input_image",
+                                "image_url": image_url,
+                            })
+                    elif item_type in ("input_text", "input_image", "input_video", "input_file"):
+                        # Already in Responses API format, pass through
+                        result.append(item)
+                    else:
+                        # Keep unknown types as-is
+                        result.append(item)
+                else:
+                    result.append(item)
+            return result
+
+        return content
 
     def _convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert OpenAI format tools to Responses API format."""
