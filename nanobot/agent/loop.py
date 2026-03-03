@@ -568,7 +568,7 @@ class AgentLoop:
         await self._save_session(session)
 
         # 2. Create persistent task
-        await self.persistence.task_store.create_task(
+        await self.persistence.create_task(
             session_key,
             last_inbound=self._inbound_to_dict(msg),
         )
@@ -643,7 +643,7 @@ class AgentLoop:
                 ))
 
             # Task completed successfully
-            await self.persistence.task_store.complete_task(session_key)
+            await self.persistence.complete_task(session_key)
 
         except asyncio.CancelledError:
             logger.info(f"Session task cancelled for {session_key}")
@@ -651,7 +651,7 @@ class AgentLoop:
             raise
         except Exception as e:
             logger.error(f"Error processing message: {e}")
-            await self.persistence.task_store.fail_task(session_key)
+            await self.persistence.fail_task(session_key)
             try:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
@@ -713,11 +713,11 @@ class AgentLoop:
             session.clear()
             await self._save_session(session)
             self.sessions.invalidate(session.key)
-            await self.persistence.task_store.complete_task(session_key)
+            await self.persistence.complete_task(session_key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
-            await self.persistence.task_store.complete_task(session_key)
+            await self.persistence.complete_task(session_key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
 
@@ -813,7 +813,7 @@ class AgentLoop:
 
     async def _recover_pending_tasks(self) -> None:
         """Recover pending tasks on startup."""
-        pending_tasks = await self.persistence.task_store.get_pending_tasks()
+        pending_tasks = await self.persistence.get_pending_tasks()
         if not pending_tasks:
             return
 
@@ -826,7 +826,7 @@ class AgentLoop:
         """Recover a single pending task."""
         if not task.last_inbound:
             logger.warning("Task {} has no last_inbound, removing", task.task_id)
-            await self.persistence.task_store.remove_task(task.session_key)
+            await self.persistence.remove_task(task.session_key)
             return
 
         # Reconstruct InboundMessage
@@ -884,7 +884,7 @@ class AgentLoop:
         current_tool_args: dict[str, Any] | None = None,
     ) -> None:
         """Update task progress in the store."""
-        await self.persistence.task_store.update_task(
+        await self.persistence.update_task(
             session_key,
             progress=progress,
             messages=messages,

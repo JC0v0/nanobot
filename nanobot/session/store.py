@@ -407,3 +407,62 @@ class PersistenceManager:
     def invalidate(self, key: str) -> None:
         """Alias for invalidate_session (compatibility with AsyncSessionManager)."""
         self.invalidate_session(key)
+
+    # ===== Task store wrapper methods (ensure DB initialized) =====
+
+    async def create_task(self, session_key: str, last_inbound: dict[str, Any]) -> TaskState:
+        """Create a new task for a session with DB initialization."""
+        await self._ensure_db()
+        return await self.task_store.create_task(session_key, last_inbound)
+
+    async def update_task(
+        self,
+        session_key: str,
+        progress: TaskProgress | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        current_iteration: int | None = None,
+        tools_used: list[str] | None = None,
+        current_tool: str | None = None,
+        current_tool_args: dict[str, Any] | None = None,
+    ) -> TaskState | None:
+        """Update a task's state with DB initialization."""
+        await self._ensure_db()
+        return await self.task_store.update_task(
+            session_key,
+            progress=progress,
+            messages=messages,
+            current_iteration=current_iteration,
+            tools_used=tools_used,
+            current_tool=current_tool,
+            current_tool_args=current_tool_args,
+        )
+
+    async def complete_task(self, session_key: str) -> None:
+        """Mark a task as completed with DB initialization."""
+        await self._ensure_db()
+        await self.task_store.complete_task(session_key)
+
+    async def fail_task(self, session_key: str) -> None:
+        """Mark a task as failed with DB initialization."""
+        await self._ensure_db()
+        await self.task_store.fail_task(session_key)
+
+    async def get_task(self, session_key: str) -> TaskState | None:
+        """Get a task by session key with DB initialization."""
+        await self._ensure_db()
+        return await self.task_store.get_task(session_key)
+
+    async def get_pending_tasks(self) -> list[TaskState]:
+        """Get all tasks that need recovery with DB initialization."""
+        await self._ensure_db()
+        return await self.task_store.get_pending_tasks()
+
+    async def remove_task(self, session_key: str) -> bool:
+        """Remove a task from the store with DB initialization."""
+        await self._ensure_db()
+        return await self.task_store.remove_task(session_key)
+
+    async def clear_all_tasks(self) -> None:
+        """Clear all tasks with DB initialization."""
+        await self._ensure_db()
+        await self.task_store.clear_all()

@@ -110,9 +110,11 @@ class TaskStore:
                         current_tool_args=json.loads(row[11]) if row[11] else None,
                     )
                     self._store[task.session_key] = task
-            logger.info("Loaded {} tasks from database", len(self._store))
+            if self._store:
+                logger.info("Loaded {} tasks from database", len(self._store))
         except Exception as e:
-            logger.warning("Failed to load task store: {}", e)
+            # Don't warn if DB is not initialized yet - this is expected
+            # PersistenceManager will initialize it when needed
             self._store = {}
 
         self._loaded = True
