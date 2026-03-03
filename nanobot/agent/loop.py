@@ -7,7 +7,7 @@ import json
 import re
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Union
 
 from loguru import logger
 
@@ -26,6 +26,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
+from nanobot.session.sqlite_store import AsyncSessionManager
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig
@@ -58,7 +59,7 @@ class AgentLoop:
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
-        session_manager: SessionManager | None = None,
+        session_manager: Union[SessionManager, AsyncSessionManager, None] = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
     ):
@@ -79,6 +80,7 @@ class AgentLoop:
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
+        self._using_async_sessions = isinstance(self.sessions, AsyncSessionManager)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -320,6 +322,20 @@ class AgentLoop:
         if not lock.locked():
             self._consolidation_locks.pop(session_key, None)
 
+    async def _get_or_create_session(self, key: str) -> Session:
+        """Get or create a session, handling both sync and async managers."""
+        if self._using_async_sessions:
+            return await self.sessions.get_or_create(key)  # type: ignore
+        else:
+            return self.sessions.get_or_create(key)  # type: ignore
+
+    async def _save_session(self, session: Session) -> None:
+        """Save a session, handling both sync and async managers."""
+        if self._using_async_sessions:
+            await self.sessions.save(session)  # type: ignore
+        else:
+            self.sessions.save(session)  # type: ignore
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -333,7 +349,7 @@ class AgentLoop:
                                 else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
-            session = self.sessions.get_or_create(key)
+            session = await self._get_or_create_session(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
@@ -342,7 +358,7 @@ class AgentLoop:
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
+            await self._save_session(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -350,7 +366,7 @@ class AgentLoop:
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         key = session_key or msg.session_key
-        session = self.sessions.get_or_create(key)
+        session = await self._get_or_create_session(key)
 
         # Slash commands
         cmd = msg.content.strip().lower()
@@ -379,7 +395,7 @@ class AgentLoop:
                 self._prune_consolidation_lock(session.key, lock)
 
             session.clear()
-            self.sessions.save(session)
+            await self._save_session(session)
             self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
@@ -438,7 +454,7 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
+        await self._save_session(session)
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -516,7 +532,7 @@ class AgentLoop:
                             else ("cli", msg.chat_id))
         logger.info("Processing system message from {}", msg.sender_id)
         key = f"{channel}:{chat_id}"
-        session = self.sessions.get_or_create(key)
+        session = await self._get_or_create_session(key)
         self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
         history = session.get_history(max_messages=self.memory_window)
         messages = self.context.build_messages(
@@ -525,7 +541,7 @@ class AgentLoop:
         )
         final_content, _, all_msgs = await self._run_agent_loop(messages)
         self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
+        await self._save_session(session)
         await self.bus.publish_outbound(OutboundMessage(
             channel=channel, chat_id=chat_id,
             content=final_content or "Background task completed."
@@ -544,9 +560,9 @@ class AgentLoop:
             return
 
         # 1. Get or create session, add user message immediately
-        session = self.sessions.get_or_create(session_key)
+        session = await self._get_or_create_session(session_key)
         self._add_user_message_to_session(session, msg)
-        self.sessions.save(session)
+        await self._save_session(session)
 
         # 2. Create persistent task
         self._task_store.create_task(
@@ -599,7 +615,7 @@ class AgentLoop:
             if cancel_event.is_set():
                 return
 
-            session = self.sessions.get_or_create(session_key)
+            session = await self._get_or_create_session(session_key)
 
             # Update task progress
             self._update_task_progress(session_key, TaskProgress.BUILDING_CONTEXT)
@@ -692,7 +708,7 @@ class AgentLoop:
                 self._prune_consolidation_lock(session.key, lock)
 
             session.clear()
-            self.sessions.save(session)
+            await self._save_session(session)
             self.sessions.invalidate(session.key)
             self._task_store.complete_task(session_key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
@@ -779,7 +795,7 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
+        await self._save_session(session)
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -831,7 +847,7 @@ class AgentLoop:
 
         # Process the task
         session_key = task.session_key
-        session = self.sessions.get_or_create(session_key)
+        session = await self._get_or_create_session(session_key)
 
         # Create cancel event
         cancel_event = asyncio.Event()

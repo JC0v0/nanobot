@@ -285,6 +285,7 @@ def _make_provider(config: Config):
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    use_sqlite: bool = typer.Option(True, "--sqlite/--no-sqlite", help="Use SQLite for session storage"),
 ):
     """Start the nanobot gateway."""
     from nanobot.config.loader import load_config, get_data_dir
@@ -292,20 +293,26 @@ def gateway(
     from nanobot.agent.loop import AgentLoop
     from nanobot.channels.manager import ChannelManager
     from nanobot.session.manager import SessionManager
+    from nanobot.session.sqlite_store import AsyncSessionManager
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    
+
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
-    
+
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
-    
+
     config = load_config()
     bus = MessageBus()
     provider = _make_provider(config)
-    session_manager = SessionManager(config.workspace_path)
+    if use_sqlite:
+        session_manager = AsyncSessionManager(config.workspace_path)
+        console.print(f"[green]✓[/green] Using SQLite session storage")
+    else:
+        session_manager = SessionManager(config.workspace_path)
+        console.print(f"[green]✓[/green] Using JSONL session storage")
     
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -352,11 +359,22 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus)
 
+    # Pre-load sessions for heartbeat targeting (handles both sync/async)
+    _cached_sessions: list[dict] = []
+    if use_sqlite:
+        # For async, we need to load in a separate async context
+        async def _load_sessions():
+            async with session_manager:
+                return await session_manager.list_sessions()
+        _cached_sessions = asyncio.run(_load_sessions())
+    else:
+        _cached_sessions = session_manager.list_sessions()
+
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
         # Prefer the most recently updated non-internal session on an enabled channel.
-        for item in session_manager.list_sessions():
+        for item in _cached_sessions:
             key = item.get("key") or ""
             if ":" not in key:
                 continue
@@ -447,16 +465,19 @@ def agent(
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
+    use_sqlite: bool = typer.Option(True, "--sqlite/--no-sqlite", help="Use SQLite for session storage"),
 ):
     """Interact with the agent directly."""
     from nanobot.config.loader import load_config, get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from nanobot.cron.service import CronService
+    from nanobot.session.manager import SessionManager
+    from nanobot.session.sqlite_store import AsyncSessionManager
     from loguru import logger
-    
+
     config = load_config()
-    
+
     bus = MessageBus()
     provider = _make_provider(config)
 
@@ -468,7 +489,12 @@ def agent(
         logger.enable("nanobot")
     else:
         logger.disable("nanobot")
-    
+
+    if use_sqlite:
+        session_manager = AsyncSessionManager(config.workspace_path)
+    else:
+        session_manager = SessionManager(config.workspace_path)
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -482,6 +508,7 @@ def agent(
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
     )
