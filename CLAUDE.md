@@ -17,10 +17,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `registry.py` - Provider specs with `is_direct` flag for bypassing LiteLLM
   - `litellm_provider.py` - LiteLLM-based provider
 
+- **`nanobot/session/`** - Session persistence
+  - `manager.py` - Original `SessionManager` with JSONL file storage
+  - `sqlite_store.py` - **NEW: `AsyncSessionManager` with SQLite backend** - async, WAL mode, memory cache
+  - `__init__.py` - Exports both managers
+
 - **`nanobot/agent/`** - Agent loop and task management
-  - `loop.py` - Main agent processing loop with `cancel_event` support
+  - `loop.py` - Main agent processing loop with `cancel_event` support, **updated to support both session managers**
   - `subagent.py` - Sub-agent spawning
   - `memory.py` - Conversation memory management
+  - `task_store.py` - Task persistence for crash recovery
 
 - **`nanobot/channels/`** - Channel integrations (Telegram, Discord, etc.)
 
@@ -52,6 +58,39 @@ The `VolcEngineProvider` (`volcengine_provider.py`) was recently implemented to 
 2. Full `cancel_event` support for request cancellation
 3. Properly handles `max_output_tokens` instead of `max_tokens`
 4. Converts `tool_choice="auto"` for function calling
+
+### Recent Major Work: SQLite Async Session Persistence
+
+The `AsyncSessionManager` (`sqlite_store.py`) was added to provide **SQLite-based async session storage** as an alternative to JSONL files.
+
+**Database Schema:**
+| Table | Purpose |
+|-------|---------|
+| `sessions` | Session metadata (key, created_at, updated_at, last_consolidated, metadata) |
+| `messages` | Individual messages with structured core fields + JSON for extensions |
+
+**Key Implementation Details:**
+1. Uses `aiosqlite` library for true async operations
+2. WAL (Write-Ahead Logging) mode enabled for better concurrency
+3. Memory cache `dict[str, Session]` for fast access
+4. Full transaction support for atomicity
+5. Backward compatible - AgentLoop supports both `SessionManager` and `AsyncSessionManager`
+
+**Message Mapping:**
+- Core fields: `role`, `content`, `timestamp`, `tool_call_id`, `name` → structured columns
+- `tool_calls` → JSON column
+- Extra fields → `extra` JSON column
+
+**CLI Usage:**
+```bash
+# Default (uses SQLite)
+nanobot agent -m "Hello"
+nanobot gateway
+
+# Use legacy JSONL
+nanobot agent -m "Hello" --no-sqlite
+nanobot gateway --no-sqlite
+```
 
 ### Design Patterns
 
@@ -91,3 +130,7 @@ Recent commits follow this pattern:
 4. **Response structure differs** - Output is in `response.output` list with items having `type` fields like `output_text`, not direct `choices[0].message`.
 
 5. **Always use `input_` prefix types** - VolcEngine Responses API expects `input_text`, `input_image`, `input_video`, `input_file` for input content.
+
+6. **AsyncSessionManager is backward compatible** - AgentLoop accepts both `SessionManager` and `AsyncSessionManager` via helper methods `_get_or_create_session()` and `_save_session()`.
+
+7. **Database location** - SQLite database is at `workspace/sessions/sessions.db`.
