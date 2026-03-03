@@ -14,7 +14,6 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.task_store import TaskProgress, TaskState, TaskStore
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -27,6 +26,8 @@ from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 from nanobot.session.sqlite_store import AsyncSessionManager
+from nanobot.session.store import PersistenceManager
+from nanobot.session.task_store import TaskProgress, TaskState
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig
@@ -60,6 +61,7 @@ class AgentLoop:
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: Union[SessionManager, AsyncSessionManager, None] = None,
+        persistence_manager: PersistenceManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
     ):
@@ -79,8 +81,10 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
 
         self.context = ContextBuilder(workspace)
-        self.sessions = session_manager or SessionManager(workspace)
-        self._using_async_sessions = isinstance(self.sessions, AsyncSessionManager)
+        self.persistence = persistence_manager or PersistenceManager(workspace)
+        # For backward compatibility, keep self.sessions pointing to persistence
+        self.sessions = self.persistence
+        self._using_async_sessions = True
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -105,8 +109,7 @@ class AgentLoop:
         # Session processing state for interruptible handling
         self._session_tasks: dict[str, asyncio.Task] = {}  # session_key -> Task
         self._session_cancel_events: dict[str, asyncio.Event] = {}  # session_key -> Event
-        # Task persistence
-        self._task_store = TaskStore(workspace / "tasks" / "tasks.jsonl")
+        # Task persistence is now part of persistence
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -201,7 +204,7 @@ class AgentLoop:
 
             # Update task progress
             if session_key:
-                self._update_task_progress(
+                await self._update_task_progress(
                     session_key,
                     TaskProgress.WAITING_LLM,
                     messages=messages,
@@ -252,7 +255,7 @@ class AgentLoop:
 
                     # Update task progress for tool execution
                     if session_key:
-                        self._update_task_progress(
+                        await self._update_task_progress(
                             session_key,
                             TaskProgress.EXECUTING_TOOL,
                             current_tool=tool_call.name,
@@ -565,11 +568,11 @@ class AgentLoop:
         await self._save_session(session)
 
         # 2. Create persistent task
-        self._task_store.create_task(
+        await self.persistence.task_store.create_task(
             session_key,
             last_inbound=self._inbound_to_dict(msg),
         )
-        self._update_task_progress(session_key, TaskProgress.PENDING)
+        await self._update_task_progress(session_key, TaskProgress.PENDING)
 
         # 3. Check if there's ongoing processing for this session
         if session_key in self._session_tasks:
@@ -618,7 +621,7 @@ class AgentLoop:
             session = await self._get_or_create_session(session_key)
 
             # Update task progress
-            self._update_task_progress(session_key, TaskProgress.BUILDING_CONTEXT)
+            await self._update_task_progress(session_key, TaskProgress.BUILDING_CONTEXT)
 
             # Process single turn with cancellation support
             response = await self._process_single_turn(
@@ -640,7 +643,7 @@ class AgentLoop:
                 ))
 
             # Task completed successfully
-            self._task_store.complete_task(session_key)
+            await self.persistence.task_store.complete_task(session_key)
 
         except asyncio.CancelledError:
             logger.info(f"Session task cancelled for {session_key}")
@@ -648,7 +651,7 @@ class AgentLoop:
             raise
         except Exception as e:
             logger.error(f"Error processing message: {e}")
-            self._task_store.fail_task(session_key)
+            await self.persistence.task_store.fail_task(session_key)
             try:
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel,
@@ -710,11 +713,11 @@ class AgentLoop:
             session.clear()
             await self._save_session(session)
             self.sessions.invalidate(session.key)
-            self._task_store.complete_task(session_key)
+            await self.persistence.task_store.complete_task(session_key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
-            self._task_store.complete_task(session_key)
+            await self.persistence.task_store.complete_task(session_key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
 
@@ -753,7 +756,7 @@ class AgentLoop:
         history = session.get_history(max_messages=self.memory_window)
 
         # Update task progress
-        self._update_task_progress(session_key, TaskProgress.BUILDING_CONTEXT)
+        await self._update_task_progress(session_key, TaskProgress.BUILDING_CONTEXT)
 
         initial_messages = self.context.build_messages(
             history=history,
@@ -775,7 +778,7 @@ class AgentLoop:
             raise asyncio.CancelledError()
 
         # Update task progress
-        self._update_task_progress(session_key, TaskProgress.AGENT_LOOP)
+        await self._update_task_progress(session_key, TaskProgress.AGENT_LOOP)
 
         final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages,
@@ -810,7 +813,7 @@ class AgentLoop:
 
     async def _recover_pending_tasks(self) -> None:
         """Recover pending tasks on startup."""
-        pending_tasks = self._task_store.get_pending_tasks()
+        pending_tasks = await self.persistence.task_store.get_pending_tasks()
         if not pending_tasks:
             return
 
@@ -823,7 +826,7 @@ class AgentLoop:
         """Recover a single pending task."""
         if not task.last_inbound:
             logger.warning("Task {} has no last_inbound, removing", task.task_id)
-            self._task_store.remove_task(task.session_key)
+            await self.persistence.task_store.remove_task(task.session_key)
             return
 
         # Reconstruct InboundMessage
@@ -870,7 +873,7 @@ class AgentLoop:
             "metadata": msg.metadata,
         }
 
-    def _update_task_progress(
+    async def _update_task_progress(
         self,
         session_key: str,
         progress: TaskProgress,
@@ -881,7 +884,7 @@ class AgentLoop:
         current_tool_args: dict[str, Any] | None = None,
     ) -> None:
         """Update task progress in the store."""
-        self._task_store.update_task(
+        await self.persistence.task_store.update_task(
             session_key,
             progress=progress,
             messages=messages,
