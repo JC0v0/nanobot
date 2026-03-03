@@ -18,67 +18,145 @@ class VolcEngineProvider(LLMProvider):
         self.default_model = default_model
         self._client = AsyncOpenAI(api_key=api_key, base_url=api_base)
 
+    @staticmethod
+    def _is_token_limit_error(e: Exception) -> bool:
+        """Check if the error is a token limit error."""
+        error_str = str(e).lower()
+        token_error_patterns = [
+            "token",
+            "context length",
+            "context_length",
+            "max tokens",
+            "total tokens",
+            "exceed",
+            "too long",
+            "invalidparameter",
+        ]
+        return any(pattern in error_str for pattern in token_error_patterns)
+
+    @staticmethod
+    def _truncate_messages_for_retry(messages: list[dict[str, Any]], keep_ratio: float = 0.7) -> list[dict[str, Any]]:
+        """
+        Truncate messages to fit within token limits.
+
+        Strategy:
+        - Always keep system message if present
+        - Keep the most recent messages (keep_ratio)
+        - Remove older messages
+        - Special: if any message has media (image/video), try to keep those
+        """
+        if len(messages) <= 2:
+            return messages  # Not enough messages to truncate
+
+        # Separate system message from others
+        system_msg = None
+        other_msgs = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_msg = msg
+            else:
+                other_msgs.append(msg)
+
+        # Calculate how many messages to keep
+        keep_count = max(1, int(len(other_msgs) * keep_ratio))
+        kept_msgs = other_msgs[-keep_count:]  # Keep most recent
+
+        # Reconstruct messages
+        result = []
+        if system_msg:
+            result.append(system_msg)
+        result.extend(kept_msgs)
+
+        return result
+
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
                    cancel_event: Any | None = None) -> LLMResponse:
-        # Convert messages to Responses API input format
-        input_data = self._convert_messages_to_input(messages)
+        # Retry logic for token limit errors
+        max_retries = 3
+        retry_count = 0
+        current_messages = list(messages)  # Make a copy for potential truncation
 
-        kwargs: dict[str, Any] = {
-            "model": model or self.default_model,
-            "input": input_data,
-            "temperature": temperature,
-        }
-        if max_tokens is not None:
-            kwargs["max_output_tokens"] = max_tokens
+        while retry_count < max_retries:
+            # Convert messages to Responses API input format
+            input_data = self._convert_messages_to_input(current_messages)
 
-        if tools:
-            # Convert OpenAI format tools to Responses API format
-            responses_tools = self._convert_tools(tools)
-            kwargs["tools"] = responses_tools
-            kwargs["tool_choice"] = "auto"
+            kwargs: dict[str, Any] = {
+                "model": model or self.default_model,
+                "input": input_data,
+                "temperature": temperature,
+            }
+            if max_tokens is not None:
+                kwargs["max_output_tokens"] = max_tokens
 
-        try:
-            # Check for cancellation before starting
-            if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
-                raise asyncio.CancelledError()
+            if tools:
+                # Convert OpenAI format tools to Responses API format
+                responses_tools = self._convert_tools(tools)
+                kwargs["tools"] = responses_tools
+                kwargs["tool_choice"] = "auto"
 
-            # Create the responses task
-            completion_task = asyncio.create_task(self._client.responses.create(**kwargs))
-
-            if cancel_event and hasattr(cancel_event, "wait"):
-                # Wait for either completion or cancellation
-                done, pending = await asyncio.wait(
-                    [completion_task, asyncio.create_task(cancel_event.wait())],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                # Clean up pending tasks
-                for task in pending:
-                    task.cancel()
-
-                if hasattr(cancel_event, "is_set") and cancel_event.is_set():
-                    completion_task.cancel()
-                    # Try to wait for cancellation
-                    try:
-                        await completion_task
-                    except asyncio.CancelledError:
-                        pass
+            try:
+                # Check for cancellation before starting
+                if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
                     raise asyncio.CancelledError()
 
-                # Get response from the completed task
-                if completion_task in done:
-                    response = completion_task.result()
-                else:
-                    # Should not reach here if cancel_event check works correctly
-                    response = await completion_task
-            else:
-                response = await completion_task
+                # Create the responses task
+                completion_task = asyncio.create_task(self._client.responses.create(**kwargs))
 
-            return self._parse_response(response)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            return LLMResponse(content=f"Error: {e}", finish_reason="error")
+                if cancel_event and hasattr(cancel_event, "wait"):
+                    # Wait for either completion or cancellation
+                    done, pending = await asyncio.wait(
+                        [completion_task, asyncio.create_task(cancel_event.wait())],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    # Clean up pending tasks
+                    for task in pending:
+                        task.cancel()
+
+                    if hasattr(cancel_event, "is_set") and cancel_event.is_set():
+                        completion_task.cancel()
+                        # Try to wait for cancellation
+                        try:
+                            await completion_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise asyncio.CancelledError()
+
+                    # Get response from the completed task
+                    if completion_task in done:
+                        response = completion_task.result()
+                    else:
+                        # Should not reach here if cancel_event check works correctly
+                        response = await completion_task
+                else:
+                    response = await completion_task
+
+                return self._parse_response(response)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Check if this is a token limit error that we can retry
+                if self._is_token_limit_error(e) and retry_count < max_retries - 1:
+                    retry_count += 1
+                    keep_ratio = 0.7 - (retry_count * 0.15)  # 0.7, 0.55, 0.4
+
+                    from loguru import logger
+                    logger.warning(
+                        f"Token limit exceeded (attempt {retry_count}/{max_retries}), "
+                        f"truncating context to {keep_ratio:.0%} and retrying..."
+                    )
+
+                    # Truncate messages for next retry
+                    current_messages = self._truncate_messages_for_retry(current_messages, keep_ratio)
+                    continue
+
+                # For other errors or if we've exhausted retries, return error gracefully
+                from loguru import logger
+                logger.error(f"LLM call failed after {retry_count} retries: {e}")
+
+                # Return error as content for graceful handling
+                return LLMResponse(content=f"Error: {e}", finish_reason="error")
 
     def _convert_messages_to_input(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert standard chat messages to Responses API input format."""
