@@ -234,3 +234,30 @@ class GraphMemoryStore(MemoryStore):
             self._graph.save()
         if self._timeline:
             self._timeline.save()
+
+    def find_similar_entities(self, threshold: float = 0.8) -> list[tuple]:
+        """Find similar entities that might be duplicates."""
+        if not self._graph:
+            return []
+        return self._graph.find_similar_entities(threshold)
+
+    def merge_entities(self, from_id: str, to_id: str) -> None:
+        """Merge one entity into another."""
+        if not self._graph:
+            return
+        self._graph.merge_entity(from_id, to_id)
+        self._graph.save()
+
+    def detect_conflicts(self) -> dict[str, list[dict]]:
+        """Detect potential conflicts in the graph."""
+        if not self._graph:
+            return {}
+        return self._graph.detect_conflicts()
+
+    def cleanup_graph(self) -> dict[str, int]:
+        """Clean up the graph by removing orphaned relationships and duplicates."""
+        if not self._graph:
+            return {}
+        result = self._graph.cleanup()
+        self._graph.save()
+        return result

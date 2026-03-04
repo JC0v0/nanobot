@@ -339,6 +339,21 @@ class MemoryGraph:
         if from_id not in self.entities or to_id not in self.entities:
             return
 
+        from_entity = self.entities[from_id]
+        to_entity = self.entities[to_id]
+
+        # Merge metadata (from_entity takes precedence)
+        merged_metadata = {**to_entity.metadata, **from_entity.metadata}
+
+        # Merge descriptions if they are different
+        if from_entity.description not in to_entity.description:
+            if to_entity.description:
+                to_entity.description = f"{to_entity.description}; {from_entity.description}"
+            else:
+                to_entity.description = from_entity.description
+
+        to_entity.metadata = merged_metadata
+
         # Update relationships
         for rel in self.relationships:
             if rel.source == from_id:
@@ -346,5 +361,148 @@ class MemoryGraph:
             if rel.target == from_id:
                 rel.target = to_id
 
+        # Remove duplicate relationships after merge
+        self._remove_duplicate_relationships()
+
         # Remove old entity
         del self.entities[from_id]
+
+    def _remove_duplicate_relationships(self) -> None:
+        """Remove duplicate relationships."""
+        seen: set[tuple[str, str, str]] = set()
+        unique: list[MemoryRelationship] = []
+        for rel in self.relationships:
+            key = (rel.source, rel.type, rel.target)
+            if key not in seen:
+                seen.add(key)
+                unique.append(rel)
+        self.relationships = unique
+
+    def find_similar_entities(self, threshold: float = 0.8) -> list[tuple[MemoryEntity, MemoryEntity, float]]:
+        """Find similar entities that might be duplicates.
+
+        Returns list of (entity1, entity2, similarity_score) tuples.
+        """
+        from difflib import SequenceMatcher
+
+        similar: list[tuple[MemoryEntity, MemoryEntity, float]] = []
+        entities = list(self.entities.values())
+
+        for i, e1 in enumerate(entities):
+            for e2 in entities[i + 1:]:
+                # Skip if different types
+                if e1.type != e2.type:
+                    continue
+
+                # Calculate similarity scores
+                id_score = SequenceMatcher(None, e1.id.lower(), e2.id.lower()).ratio()
+                name_score = SequenceMatcher(None, e1.name.lower(), e2.name.lower()).ratio()
+                desc_score = SequenceMatcher(None, e1.description.lower(), e2.description.lower()).ratio()
+
+                # Combined score
+                score = (id_score * 0.4 + name_score * 0.4 + desc_score * 0.2)
+
+                if score >= threshold:
+                    similar.append((e1, e2, score))
+
+        return similar
+
+    def detect_conflicts(self) -> dict[str, list[dict[str, Any]]]:
+        """Detect potential conflicts in the graph.
+
+        Returns a dict with conflict types mapped to conflict details.
+        """
+        conflicts: dict[str, list[dict[str, Any]]] = {
+            "duplicate_relationships": [],
+            "orphaned_relationships": [],
+            "conflicting_descriptions": [],
+        }
+
+        # Check for duplicate relationships (look for duplicates even if add_relationship prevents them)
+        # This helps with detecting issues from manual edits or loading from file
+        seen: dict[tuple[str, str, str], list[int]] = {}
+        for idx, rel in enumerate(self.relationships):
+            key = (rel.source, rel.type, rel.target)
+            if key in seen:
+                seen[key].append(idx)
+            else:
+                seen[key] = [idx]
+
+        for key, indices in seen.items():
+            if len(indices) > 1:
+                conflicts["duplicate_relationships"].append({
+                    "source": key[0],
+                    "type": key[1],
+                    "target": key[2],
+                    "count": len(indices),
+                })
+
+        # Check for orphaned relationships
+        for idx, rel in enumerate(self.relationships):
+            source_exists = rel.source in self.entities
+            target_exists = rel.target in self.entities
+            if not source_exists or not target_exists:
+                conflicts["orphaned_relationships"].append({
+                    "index": idx,
+                    "source": rel.source,
+                    "source_exists": source_exists,
+                    "type": rel.type,
+                    "target": rel.target,
+                    "target_exists": target_exists,
+                })
+
+        # Check for entities with same name/type but conflicting descriptions
+        by_name_type: dict[tuple[str, str], list[MemoryEntity]] = {}
+        for entity in self.entities.values():
+            key = (entity.name.lower(), entity.type)
+            by_name_type.setdefault(key, []).append(entity)
+
+        for (name, entity_type), entities in by_name_type.items():
+            if len(entities) > 1:
+                # Check if descriptions are significantly different
+                descs = [e.description for e in entities]
+                from difflib import SequenceMatcher
+                for i, d1 in enumerate(descs):
+                    for d2 in descs[i + 1:]:
+                        score = SequenceMatcher(None, d1.lower(), d2.lower()).ratio()
+                        if score < 0.5 and d1 and d2:
+                            conflicts["conflicting_descriptions"].append({
+                                "type": entity_type,
+                                "name": name,
+                                "entities": [e.id for e in entities],
+                                "descriptions": descs,
+                            })
+                            break
+                    else:
+                        continue
+                    break
+
+        # Remove empty conflict categories
+        return {k: v for k, v in conflicts.items() if v}
+
+    def cleanup(self) -> dict[str, int]:
+        """Clean up the graph by removing orphaned relationships and duplicates.
+
+        Returns counts of what was cleaned up.
+        """
+        result = {
+            "duplicate_relationships_removed": 0,
+            "orphaned_relationships_removed": 0,
+        }
+
+        # Count before removal
+        before_count = len(self.relationships)
+
+        # Remove duplicates
+        self._remove_duplicate_relationships()
+        result["duplicate_relationships_removed"] = before_count - len(self.relationships)
+
+        # Remove orphaned relationships
+        before_count = len(self.relationships)
+        self.relationships = [
+            rel for rel in self.relationships
+            if rel.source in self.entities and rel.target in self.entities
+        ]
+        result["orphaned_relationships_removed"] = before_count - len(self.relationships)
+
+        return result
