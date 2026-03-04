@@ -6,6 +6,8 @@ This module provides memory management for the agent, including:
 - Timeline: Chronological event timeline
 - GraphMemoryStore: Enhanced memory store combining all of the above
 - EntityExtractor: LLM-based entity/relationship extraction
+- MemoryRetriever: Abstract and rule-based retrievers
+- ContextLinker: Builds graph context for queries
 
 For backward compatibility, the default export is still LegacyMemoryStore
 under the name 'MemoryStore'.
@@ -20,6 +22,13 @@ from nanobot.agent.memory.graph import (
     MemoryRelationship,
 )
 from nanobot.agent.memory.graph_store import GraphMemoryStore
+from nanobot.agent.memory.linker import ContextLinker
+from nanobot.agent.memory.retriever import (
+    MemoryRetriever,
+    NoopRetriever,
+    RetrievalResult,
+    RuleBasedRetriever,
+)
 from nanobot.agent.memory.store import LegacyMemoryStore, _SAVE_MEMORY_TOOL
 from nanobot.agent.memory.timeline import Timeline, TimelineEntry
 
@@ -36,6 +45,13 @@ __all__ = [
     "GraphMemoryStore",
     # Entity extractor
     "EntityExtractor",
+    # Retrievers
+    "MemoryRetriever",
+    "NoopRetriever",
+    "RuleBasedRetriever",
+    "RetrievalResult",
+    # Context linker
+    "ContextLinker",
     # Graph components
     "MemoryGraph",
     "MemoryEntity",
