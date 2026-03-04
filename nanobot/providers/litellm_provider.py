@@ -187,8 +187,9 @@ class LiteLLMProvider(LLMProvider):
 
         Strategy:
         - Always keep system message if present
-        - Keep the most recent messages (keep_ratio)
-        - Remove older messages
+        - First pass: strip images from all non-recent messages
+        - Second pass: keep the most recent messages (keep_ratio)
+        - Always keep the most recent user message intact
         """
         if len(messages) <= 2:
             return messages  # Not enough messages to truncate
@@ -202,9 +203,23 @@ class LiteLLMProvider(LLMProvider):
             else:
                 other_msgs.append(msg)
 
+        if not other_msgs:
+            return messages
+
+        # First: strip images from all messages except the very last one
+        processed_msgs = []
+        for i, msg in enumerate(other_msgs):
+            # Keep the last message intact (most likely has the current image)
+            if i == len(other_msgs) - 1:
+                processed_msgs.append(msg)
+            else:
+                # Strip images from older messages
+                processed_msg = LiteLLMProvider._strip_images_from_message(msg)
+                processed_msgs.append(processed_msg)
+
         # Calculate how many messages to keep
-        keep_count = max(1, int(len(other_msgs) * keep_ratio))
-        kept_msgs = other_msgs[-keep_count:]  # Keep most recent
+        keep_count = max(1, int(len(processed_msgs) * keep_ratio))
+        kept_msgs = processed_msgs[-keep_count:]  # Keep most recent
 
         # Reconstruct messages
         result = []
@@ -213,6 +228,34 @@ class LiteLLMProvider(LLMProvider):
         result.extend(kept_msgs)
 
         return result
+
+    @staticmethod
+    def _strip_images_from_message(msg: dict[str, Any]) -> dict[str, Any]:
+        """Strip image content from a message to save tokens."""
+        msg = dict(msg)
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            return msg
+
+        if isinstance(content, list):
+            new_content = []
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    if part_type in ("image_url", "input_image", "input_video", "input_file"):
+                        # Replace with placeholder
+                        new_content.append({
+                            "type": "text",
+                            "text": f"[{part_type.replace('input_', '').capitalize()} omitted]"
+                        })
+                    else:
+                        new_content.append(part)
+                else:
+                    new_content.append(part)
+            msg["content"] = new_content
+
+        return msg
 
     async def chat(
         self,

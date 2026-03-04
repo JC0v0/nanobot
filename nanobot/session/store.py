@@ -15,9 +15,138 @@ from typing import Any
 import aiosqlite
 from loguru import logger
 
-from nanobot.session.manager import Session
 from nanobot.session.task_store import TaskStore, TaskState, TaskProgress
 from nanobot.utils.helpers import ensure_dir
+
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
+
+
+@dataclass
+class Session:
+    """
+    A conversation session.
+
+    Important: Messages are append-only for LLM cache efficiency.
+    The consolidation process writes summaries to MEMORY.md/HISTORY.md
+    but does NOT modify the messages list or get_history() output.
+    """
+
+    key: str  # channel:chat_id
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    last_consolidated: int = 0  # Number of messages already consolidated to files
+
+    def add_message(self, role: str, content: str, **kwargs: Any) -> None:
+        """Add a message to the session."""
+        msg = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat(),
+            **kwargs,
+        }
+        self.messages.append(msg)
+        self.updated_at = datetime.now()
+
+    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
+        """Return unconsolidated messages for LLM input, aligned to a user turn."""
+        unconsolidated = self.messages[self.last_consolidated :]
+        sliced = unconsolidated[-max_messages:]
+
+        # Drop leading non-user messages to avoid orphaned tool_result blocks
+        for i, m in enumerate(sliced):
+            if m.get("role") == "user":
+                sliced = sliced[i:]
+                break
+
+        out: list[dict[str, Any]] = []
+        for m in sliced:
+            entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
+            for k in ("tool_calls", "tool_call_id", "name", "media"):
+                if k in m:
+                    entry[k] = m[k]
+            out.append(entry)
+        return out
+
+    def _count_message_tokens(self, msg: dict[str, Any], encoding: Any) -> int:
+        """Count tokens for a single message."""
+        tokens = 4
+        for key, value in msg.items():
+            if value is None:
+                continue
+            if isinstance(value, str):
+                tokens += len(encoding.encode(value))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        tokens += self._count_message_tokens(item, encoding)
+        return tokens
+
+    def get_history_by_tokens(
+        self,
+        max_tokens: int = 64000,
+        keep_last: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Return unconsolidated messages within token limit, preserving recent messages."""
+        if tiktoken is None:
+            logger.warning(
+                "tiktoken not available, falling back to message count limit"
+            )
+            return self.get_history(max_messages=keep_last)
+
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            logger.warning(
+                "Failed to load tiktoken encoding, falling back to message count"
+            )
+            return self.get_history(max_messages=keep_last)
+
+        unconsolidated = self.messages[self.last_consolidated :]
+
+        if not unconsolidated:
+            return []
+
+        for i, m in enumerate(unconsolidated):
+            if m.get("role") == "user":
+                unconsolidated = unconsolidated[i:]
+                break
+
+        if not unconsolidated:
+            return []
+
+        total_tokens = 0
+        result: list[dict[str, Any]] = []
+
+        for m in reversed(unconsolidated):
+            entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
+            for k in ("tool_calls", "tool_call_id", "name", "media"):
+                if k in m:
+                    entry[k] = m[k]
+
+            msg_tokens = self._count_message_tokens(entry, encoding)
+
+            # Always keep at least keep_last messages
+            if len(result) < keep_last:
+                result.insert(0, entry)
+                total_tokens += msg_tokens
+            elif total_tokens + msg_tokens <= max_tokens:
+                result.insert(0, entry)
+                total_tokens += msg_tokens
+            else:
+                break
+
+        return result
+
+    def clear(self) -> None:
+        """Clear all messages and reset session to initial state."""
+        self.messages = []
+        self.last_consolidated = 0
+        self.updated_at = datetime.now()
 
 
 @dataclass
@@ -84,7 +213,7 @@ class PersistenceManager:
         if self._db is None:
             return
 
-        # Sessions table (from original AsyncSessionManager)
+        # Sessions table
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,7 +225,7 @@ class PersistenceManager:
             )
         """)
 
-        # Messages table (from original AsyncSessionManager)
+        # Messages table
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,7 +286,7 @@ class PersistenceManager:
         # This is just a placeholder for any data migration needed
         logger.info("Migrating database from v1 to v2: adding tasks table")
 
-    # ===== SessionStore methods (moved from AsyncSessionManager) =====
+    # ===== SessionStore methods =====
 
     async def get_or_create_session(self, key: str) -> Session:
         """
@@ -190,7 +319,7 @@ class PersistenceManager:
             async with self._db.execute(
                 "SELECT id, key, created_at, updated_at, last_consolidated, metadata "
                 "FROM sessions WHERE key = ?",
-                (key,)
+                (key,),
             ) as cursor:
                 row = await cursor.fetchone()
                 if row is None:
@@ -207,7 +336,7 @@ class PersistenceManager:
                     created_at=datetime.fromisoformat(row["created_at"]),
                     updated_at=datetime.fromisoformat(row["updated_at"]),
                     metadata=metadata,
-                    last_consolidated=row["last_consolidated"] or 0
+                    last_consolidated=row["last_consolidated"] or 0,
                 )
         except Exception as e:
             logger.warning("Failed to load session {}: {}", key, e)
@@ -222,7 +351,7 @@ class PersistenceManager:
         async with self._db.execute(
             "SELECT position, role, content, timestamp, tool_call_id, name, tool_calls, extra "
             "FROM messages WHERE session_id = ? ORDER BY position",
-            (session_id,)
+            (session_id,),
         ) as cursor:
             async for row in cursor:
                 msg = self._row_to_message(row)
@@ -275,53 +404,65 @@ class PersistenceManager:
         if self._db is None:
             raise RuntimeError("Database not initialized")
 
-        metadata_json = json.dumps(session.metadata, ensure_ascii=False) if session.metadata else None
+        metadata_json = (
+            json.dumps(session.metadata, ensure_ascii=False)
+            if session.metadata
+            else None
+        )
 
         async with self._db.execute(
-            "SELECT id FROM sessions WHERE key = ?",
-            (session.key,)
+            "SELECT id FROM sessions WHERE key = ?", (session.key,)
         ) as cursor:
             row = await cursor.fetchone()
             if row is not None:
                 session_id = row["id"]
-                await self._db.execute("""
+                await self._db.execute(
+                    """
                     UPDATE sessions
                     SET updated_at = ?, last_consolidated = ?, metadata = ?
                     WHERE id = ?
-                """, (
-                    session.updated_at.isoformat(),
-                    session.last_consolidated,
-                    metadata_json,
-                    session_id
-                ))
+                """,
+                    (
+                        session.updated_at.isoformat(),
+                        session.last_consolidated,
+                        metadata_json,
+                        session_id,
+                    ),
+                )
                 return session_id
             else:
-                cursor = await self._db.execute("""
+                cursor = await self._db.execute(
+                    """
                     INSERT INTO sessions (key, created_at, updated_at, last_consolidated, metadata)
                     VALUES (?, ?, ?, ?, ?)
-                """, (
-                    session.key,
-                    session.created_at.isoformat(),
-                    session.updated_at.isoformat(),
-                    session.last_consolidated,
-                    metadata_json
-                ))
+                """,
+                    (
+                        session.key,
+                        session.created_at.isoformat(),
+                        session.updated_at.isoformat(),
+                        session.last_consolidated,
+                        metadata_json,
+                    ),
+                )
                 return cursor.lastrowid or 0
 
-    async def _replace_messages(self, session_id: int, messages: list[dict[str, Any]]) -> None:
+    async def _replace_messages(
+        self, session_id: int, messages: list[dict[str, Any]]
+    ) -> None:
         """Replace all messages for a session."""
         if self._db is None:
             return
 
         await self._db.execute(
-            "DELETE FROM messages WHERE session_id = ?",
-            (session_id,)
+            "DELETE FROM messages WHERE session_id = ?", (session_id,)
         )
 
         for position, msg in enumerate(messages):
             await self._insert_message(session_id, position, msg)
 
-    async def _insert_message(self, session_id: int, position: int, msg: dict[str, Any]) -> None:
+    async def _insert_message(
+        self, session_id: int, position: int, msg: dict[str, Any]
+    ) -> None:
         """Insert a single message."""
         if self._db is None:
             return
@@ -333,20 +474,39 @@ class PersistenceManager:
         name = msg.get("name")
         tool_calls = msg.get("tool_calls")
 
-        core_keys = {"role", "content", "timestamp", "tool_call_id", "name", "tool_calls"}
+        core_keys = {
+            "role",
+            "content",
+            "timestamp",
+            "tool_call_id",
+            "name",
+            "tool_calls",
+        }
         extra = {k: v for k, v in msg.items() if k not in core_keys}
 
-        tool_calls_json = json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+        tool_calls_json = (
+            json.dumps(tool_calls, ensure_ascii=False) if tool_calls else None
+        )
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
 
-        await self._db.execute("""
+        await self._db.execute(
+            """
             INSERT INTO messages (session_id, position, role, content, timestamp,
                                    tool_call_id, name, tool_calls, extra)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            session_id, position, role, content, timestamp,
-            tool_call_id, name, tool_calls_json, extra_json
-        ))
+        """,
+            (
+                session_id,
+                position,
+                role,
+                content,
+                timestamp,
+                tool_call_id,
+                name,
+                tool_calls_json,
+                extra_json,
+            ),
+        )
 
     def invalidate_session(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
@@ -371,12 +531,14 @@ class PersistenceManager:
             ORDER BY updated_at DESC
         """) as cursor:
             async for row in cursor:
-                sessions.append({
-                    "key": row["key"],
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                    "path": str(self._db_path)
-                })
+                sessions.append(
+                    {
+                        "key": row["key"],
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                        "path": str(self._db_path),
+                    }
+                )
 
         return sessions
 
@@ -394,23 +556,25 @@ class PersistenceManager:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await self.close()
 
-    # ===== Compatibility aliases (for easier migration) =====
+    # ===== Compatibility aliases =====
 
     async def get_or_create(self, key: str) -> Session:
-        """Alias for get_or_create_session (compatibility with AsyncSessionManager)."""
+        """Alias for get_or_create_session."""
         return await self.get_or_create_session(key)
 
     async def save(self, session: Session) -> None:
-        """Alias for save_session (compatibility with AsyncSessionManager)."""
+        """Alias for save_session."""
         await self.save_session(session)
 
     def invalidate(self, key: str) -> None:
-        """Alias for invalidate_session (compatibility with AsyncSessionManager)."""
+        """Alias for invalidate_session."""
         self.invalidate_session(key)
 
     # ===== Task store wrapper methods (ensure DB initialized) =====
 
-    async def create_task(self, session_key: str, last_inbound: dict[str, Any]) -> TaskState:
+    async def create_task(
+        self, session_key: str, last_inbound: dict[str, Any]
+    ) -> TaskState:
         """Create a new task for a session with DB initialization."""
         await self._ensure_db()
         return await self.task_store.create_task(session_key, last_inbound)

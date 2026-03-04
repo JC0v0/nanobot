@@ -26,7 +26,7 @@ from nanobot.agent.memory.timeline import Timeline, TimelineEntry
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
-    from nanobot.session.manager import Session
+    from nanobot.session.store import Session
 
 
 class GraphMemoryStore(MemoryStore):
@@ -36,7 +36,7 @@ class GraphMemoryStore(MemoryStore):
     adding graph-based memory capabilities.
     """
 
-    def __init__(self, workspace: Path, *, enable_graph: bool = True):
+    def __init__(self, workspace: Path, *, enable_graph: bool = False):
         self.workspace = workspace
         self.enable_graph = enable_graph
 
@@ -120,7 +120,7 @@ class GraphMemoryStore(MemoryStore):
         model: str,
         *,
         archive_all: bool = False,
-        memory_window: int = 50,
+        memory_window: int = 10,
     ) -> bool:
         """Consolidate old messages into memory.
 
@@ -129,13 +129,20 @@ class GraphMemoryStore(MemoryStore):
         """
         # First run legacy consolidation
         legacy_success = await self._legacy.consolidate(
-            session, provider, model,
+            session,
+            provider,
+            model,
             archive_all=archive_all,
             memory_window=memory_window,
         )
 
         # If graph is disabled, we're done
-        if not self.enable_graph or not self._graph or not self._timeline or not self._extractor:
+        if (
+            not self.enable_graph
+            or not self._graph
+            or not self._timeline
+            or not self._extractor
+        ):
             return legacy_success
 
         # Extract entities if we have messages to process
@@ -144,12 +151,14 @@ class GraphMemoryStore(MemoryStore):
                 old_messages = session.messages
             else:
                 keep_count = memory_window // 2
-                old_messages = session.messages[session.last_consolidated : -keep_count] if keep_count > 0 else []
+                old_messages = (
+                    session.messages[session.last_consolidated : -keep_count]
+                    if keep_count > 0
+                    else []
+                )
 
             if old_messages:
-                await self._extract_and_update_graph(
-                    old_messages, provider, model
-                )
+                await self._extract_and_update_graph(old_messages, provider, model)
         except Exception as e:
             logger.warning("Failed to update memory graph: {}", e)
             # Don't fail the whole consolidation if graph update fails
@@ -167,9 +176,7 @@ class GraphMemoryStore(MemoryStore):
             return
 
         # Use the extractor
-        result = await self._extractor.extract_from_messages(
-            messages, provider, model
-        )
+        result = await self._extractor.extract_from_messages(messages, provider, model)
 
         if not result:
             return

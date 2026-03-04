@@ -162,21 +162,90 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         system_prompt = self.build_system_prompt(skill_names)
         messages.append({"role": "system", "content": system_prompt})
 
-        # History
-        messages.extend(history)
+        # History - strip base64 images from old messages to save tokens
+        for msg in history:
+            processed_msg = self._strip_history_images(msg)
+            messages.append(processed_msg)
 
         # Current message (with optional image attachments)
-        user_content = self._build_user_content(current_message, media)
+        user_content = self._build_user_content(current_message, media, image_detail="low")
         user_content = self._inject_runtime_context(user_content, channel, chat_id)
         messages.append({"role": "user", "content": user_content})
 
         return messages
 
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+    @staticmethod
+    def _strip_history_images(msg: dict[str, Any]) -> dict[str, Any]:
+        """
+        Strip base64 image data from history messages to save tokens.
+        Replaces image content with file path references from the 'media' field.
+        """
+        msg = dict(msg)
+        content = msg.get("content")
+        media_paths = msg.get("media", [])  # Get media paths from the message
+
+        # If content is a string, no images to strip
+        if isinstance(content, str):
+            return msg
+
+        # If content is a list, process each part
+        if isinstance(content, list):
+            new_content = []
+            media_index = 0
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    # Handle image types
+                    if part_type == "image_url":
+                        # Use path from media field if available
+                        if media_index < len(media_paths):
+                            path = media_paths[media_index]
+                            new_content.append({
+                                "type": "text",
+                                "text": f"[Image: {path}]"
+                            })
+                            media_index += 1
+                        else:
+                            # No path available, just note that an image was present
+                            new_content.append({
+                                "type": "text",
+                                "text": "[Image: previously sent]"
+                            })
+                    elif part_type in ("input_image", "input_video", "input_file"):
+                        # VolcEngine format - also try to use media paths
+                        if media_index < len(media_paths):
+                            path = media_paths[media_index]
+                            new_content.append({
+                                "type": "text",
+                                "text": f"[{part_type.replace('input_', '').capitalize()}: {path}]"
+                            })
+                            media_index += 1
+                        else:
+                            new_content.append({
+                                "type": "text",
+                                "text": f"[{part_type.replace('input_', '').capitalize()} omitted to save tokens]"
+                            })
+                    else:
+                        # Keep non-image parts
+                        new_content.append(part)
+                else:
+                    new_content.append(part)
+
+            msg["content"] = new_content
+
+        return msg
+
+    def _build_user_content(self, text: str, media: list[str] | None, image_detail: str = "low") -> str | list[dict[str, Any]]:
+        """Build user message content with optional base64-encoded images.
+
+        Args:
+            text: The text content
+            media: List of media file paths
+            image_detail: Detail level for images - "low", "auto", or "high"
+        """
         if not media:
             return text
-        
+
         images = []
         for path in media:
             p = Path(path)
@@ -184,8 +253,14 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             if not p.is_file() or not mime or not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(p.read_bytes()).decode()
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-        
+            images.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{b64}",
+                    "detail": image_detail,
+                }
+            })
+
         if not images:
             return text
         return images + [{"type": "text", "text": text}]

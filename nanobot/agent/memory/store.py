@@ -18,7 +18,7 @@ from nanobot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
-    from nanobot.session.manager import Session
+    from nanobot.session.store import Session
 
 
 _SAVE_MEMORY_TOOL = [
@@ -79,7 +79,7 @@ class LegacyMemoryStore(MemoryStore):
         model: str,
         *,
         archive_all: bool = False,
-        memory_window: int = 50,
+        memory_window: int = 10,
     ) -> bool:
         """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
 
@@ -88,24 +88,34 @@ class LegacyMemoryStore(MemoryStore):
         if archive_all:
             old_messages = session.messages
             keep_count = 0
-            logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
+            logger.info(
+                "Memory consolidation (archive_all): {} messages", len(session.messages)
+            )
         else:
             keep_count = memory_window // 2
             if len(session.messages) <= keep_count:
                 return True
             if len(session.messages) - session.last_consolidated <= 0:
                 return True
-            old_messages = session.messages[session.last_consolidated:-keep_count]
+            old_messages = session.messages[session.last_consolidated : -keep_count]
             if not old_messages:
                 return True
-            logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
+            logger.info(
+                "Memory consolidation: {} to consolidate, {} keep",
+                len(old_messages),
+                keep_count,
+            )
 
         lines = []
         for m in old_messages:
             if not m.get("content"):
                 continue
-            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
-            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
+            tools = (
+                f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
+            )
+            lines.append(
+                f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}"
+            )
 
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
@@ -119,7 +129,10 @@ class LegacyMemoryStore(MemoryStore):
         try:
             response = await provider.chat(
                 messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+                    {
+                        "role": "system",
+                        "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+                    },
                     {"role": "user", "content": prompt},
                 ],
                 tools=_SAVE_MEMORY_TOOL,
@@ -127,7 +140,9 @@ class LegacyMemoryStore(MemoryStore):
             )
 
             if not response.has_tool_calls:
-                logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
+                logger.warning(
+                    "Memory consolidation: LLM did not call save_memory, skipping"
+                )
                 return False
 
             args = response.tool_calls[0].arguments
@@ -135,7 +150,10 @@ class LegacyMemoryStore(MemoryStore):
             if isinstance(args, str):
                 args = json.loads(args)
             if not isinstance(args, dict):
-                logger.warning("Memory consolidation: unexpected arguments type {}", type(args).__name__)
+                logger.warning(
+                    "Memory consolidation: unexpected arguments type {}",
+                    type(args).__name__,
+                )
                 return False
 
             if entry := args.get("history_entry"):
@@ -148,8 +166,14 @@ class LegacyMemoryStore(MemoryStore):
                 if update != current_memory:
                     self.write_long_term(update)
 
-            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
-            logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
+            session.last_consolidated = (
+                0 if archive_all else len(session.messages) - keep_count
+            )
+            logger.info(
+                "Memory consolidation done: {} messages, last_consolidated={}",
+                len(session.messages),
+                session.last_consolidated,
+            )
             return True
         except Exception:
             logger.exception("Memory consolidation failed")

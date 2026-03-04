@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
-    from nanobot.session.manager import Session
+    from nanobot.session.store import Session
 
 
 class MemoryStore(ABC):

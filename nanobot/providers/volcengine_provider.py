@@ -41,9 +41,9 @@ class VolcEngineProvider(LLMProvider):
 
         Strategy:
         - Always keep system message if present
-        - Keep the most recent messages (keep_ratio)
-        - Remove older messages
-        - Special: if any message has media (image/video), try to keep those
+        - First pass: strip images from all non-recent messages
+        - Second pass: keep the most recent messages (keep_ratio)
+        - Special: keep the most recent message intact (might have current image)
         """
         if len(messages) <= 2:
             return messages  # Not enough messages to truncate
@@ -57,9 +57,23 @@ class VolcEngineProvider(LLMProvider):
             else:
                 other_msgs.append(msg)
 
+        if not other_msgs:
+            return messages
+
+        # First: strip images from all messages except the very last one
+        processed_msgs = []
+        for i, msg in enumerate(other_msgs):
+            # Keep the last message intact (most likely has the current image)
+            if i == len(other_msgs) - 1:
+                processed_msgs.append(msg)
+            else:
+                # Strip images from older messages
+                processed_msg = VolcEngineProvider._strip_images_from_message(msg)
+                processed_msgs.append(processed_msg)
+
         # Calculate how many messages to keep
-        keep_count = max(1, int(len(other_msgs) * keep_ratio))
-        kept_msgs = other_msgs[-keep_count:]  # Keep most recent
+        keep_count = max(1, int(len(processed_msgs) * keep_ratio))
+        kept_msgs = processed_msgs[-keep_count:]  # Keep most recent
 
         # Reconstruct messages
         result = []
@@ -68,6 +82,34 @@ class VolcEngineProvider(LLMProvider):
         result.extend(kept_msgs)
 
         return result
+
+    @staticmethod
+    def _strip_images_from_message(msg: dict[str, Any]) -> dict[str, Any]:
+        """Strip image content from a message to save tokens."""
+        msg = dict(msg)
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            return msg
+
+        if isinstance(content, list):
+            new_content = []
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    if part_type in ("image_url", "input_image", "input_video", "input_file"):
+                        # Replace with placeholder
+                        new_content.append({
+                            "type": "text" if part_type == "image_url" else "input_text",
+                            "text": f"[{part_type.replace('input_', '').capitalize()} omitted]"
+                        })
+                    else:
+                        new_content.append(part)
+                else:
+                    new_content.append(part)
+            msg["content"] = new_content
+
+        return msg
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7,
@@ -235,7 +277,7 @@ class VolcEngineProvider(LLMProvider):
                         image_url = item.get("image_url", {})
                         if isinstance(image_url, dict):
                             url = image_url.get("url", "")
-                            detail = image_url.get("detail", "high")
+                            detail = image_url.get("detail", "low")
                             image_item: dict[str, Any] = {
                                 "type": "input_image",
                                 "image_url": url,
@@ -247,6 +289,7 @@ class VolcEngineProvider(LLMProvider):
                             result.append({
                                 "type": "input_image",
                                 "image_url": image_url,
+                                "detail": "low",
                             })
 
                     # OpenAI video_url format -> Responses API input_video
