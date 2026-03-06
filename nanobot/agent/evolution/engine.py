@@ -150,9 +150,13 @@ class EvolutionEngine:
         return (
             "Analyze this completed task and propose minimal capability evolution.\n"
             "Prefer updating existing skills/tools over creating new ones.\n"
-            "IMPORTANT: name constraints:\n"
+            "IMPORTANT name constraints:\n"
             "  - For skill_*: use lowercase kebab-case (2-63 chars, a-z 0-9 - only)\n"
             "  - For tool_*: use lowercase snake_case (2-64 chars, a-z 0-9 _ only)\n"
+            "IMPORTANT content format:\n"
+            "  - For tool_create/tool_update: content MUST be valid Python code that can be written to a .py file\n"
+            "  - For skill_create/skills_update: content MUST be valid markdown (SKILL.md format)\n"
+            "  - Do NOT write explanations or instructions in content, write the actual code/markdown\n"
             "Output JSON with schema:\n"
             "{\n"
             '  "summary": "string",\n'
@@ -161,8 +165,8 @@ class EvolutionEngine:
             '    "kind": "skill_update|skill_create|skill_deprecate|tool_update|tool_create|tool_deprecate",\n'
             '    "name": "string",\n'
             '    "description": "string optional",\n'
-            '    "reason": "string",\n'
-            '    "content": "full content for create/update, optional otherwise"\n'
+            '    "reason": "string explaining why this change is needed",\n'
+            '    "content": "full Python code for tools OR markdown for skills (NOT instructions)"\n'
             "  }]\n"
             "}\n\n"
             f"User request:\n{user_message}\n\n"

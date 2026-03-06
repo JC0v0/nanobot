@@ -302,7 +302,7 @@ class SelfEvolutionConfig(Base):
 
     enabled: bool = True
     mode: str = "propose"  # propose | auto_safe
-    min_confidence: float = 0.75
+    min_confidence: float = 0.9
     notify: bool = True
 
 
