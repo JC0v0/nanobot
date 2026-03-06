@@ -283,21 +283,11 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # Seconds before a tool call is cancelled
 
 
-class SelfEvolutionConfig(Base):
-    """Self-evolution behavior configuration."""
-
-    enabled: bool = True
-    mode: str = "auto_safe"  # propose | auto_safe
-    min_confidence: float = 0.6
-    notify: bool = True
-
-
 class ToolsConfig(Base):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
-    self_evolution: SelfEvolutionConfig = Field(default_factory=SelfEvolutionConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 

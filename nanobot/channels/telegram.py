@@ -151,15 +151,10 @@ class TelegramChannel(BaseChannel):
             read_timeout=30.0,
         )
         builder = (
-            Application.builder()
-            .token(self.config.token)
-            .request(req)
-            .get_updates_request(req)
+            Application.builder().token(self.config.token).request(req).get_updates_request(req)
         )
         if self.config.proxy:
-            builder = builder.proxy(self.config.proxy).get_updates_proxy(
-                self.config.proxy
-            )
+            builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
@@ -168,7 +163,6 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("status", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
-        self._app.add_handler(CommandHandler("evolution", self._forward_command))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -277,9 +271,7 @@ class TelegramChannel(BaseChannel):
                     else "document"
                 )
                 with open(media_path, "rb") as f:
-                    await sender(
-                        chat_id=chat_id, **{param: f}, reply_parameters=reply_params
-                    )
+                    await sender(chat_id=chat_id, **{param: f}, reply_parameters=reply_params)
             except Exception as e:
                 filename = media_path.rsplit("/", 1)[-1]
                 logger.error("Failed to send media {}: {}", media_path, e)
@@ -301,9 +293,7 @@ class TelegramChannel(BaseChannel):
                         reply_parameters=reply_params,
                     )
                 except Exception as e:
-                    logger.warning(
-                        "HTML parse failed, falling back to plain text: {}", e
-                    )
+                    logger.warning("HTML parse failed, falling back to plain text: {}", e)
                     try:
                         await self._app.bot.send_message(
                             chat_id=chat_id, text=chunk, reply_parameters=reply_params
@@ -311,9 +301,7 @@ class TelegramChannel(BaseChannel):
                     except Exception as e2:
                         logger.error("Error sending Telegram message: {}", e2)
 
-    async def _on_start(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
         if not update.message or not update.effective_user:
             return
@@ -322,13 +310,10 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text(
             f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
             "Send me a message and I'll respond!\n"
-            "Type /help to see available commands.\n"
-            "Use /evolution to manage self-evolution proposals."
+            "Type /help to see available commands."
         )
 
-    async def _on_help(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command, bypassing ACL so all users can access it."""
         if not update.message:
             return
@@ -336,7 +321,6 @@ class TelegramChannel(BaseChannel):
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
             "/status — Show current context info\n"
-            "/evolution — Manage self-evolution proposals\n"
             "/help — Show available commands"
         )
 
@@ -346,9 +330,7 @@ class TelegramChannel(BaseChannel):
         sid = str(user.id)
         return f"{sid}|{user.username}" if user.username else sid
 
-    async def _forward_command(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Forward slash commands to the bus for unified handling in AgentLoop."""
         if not update.message or not update.effective_user:
             return
@@ -358,9 +340,7 @@ class TelegramChannel(BaseChannel):
             content=update.message.text,
         )
 
-    async def _on_message(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages (text, photos, voice, documents)."""
         if not update.message or not update.effective_user:
             return
@@ -404,9 +384,7 @@ class TelegramChannel(BaseChannel):
         if media_file and self._app:
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
-                ext = self._get_extension(
-                    media_type, getattr(media_file, "mime_type", None)
-                )
+                ext = self._get_extension(media_type, getattr(media_file, "mime_type", None))
 
                 # Save to workspace/media/
                 from pathlib import Path
@@ -428,9 +406,7 @@ class TelegramChannel(BaseChannel):
                     transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
                     transcription = await transcriber.transcribe(file_path)
                     if transcription:
-                        logger.info(
-                            "Transcribed {}: {}...", media_type, transcription[:50]
-                        )
+                        logger.info("Transcribed {}: {}...", media_type, transcription[:50])
                         content_parts.append(f"[transcription: {transcription}]")
                     else:
                         content_parts.append(f"[{media_type}: {file_path}]")
@@ -482,18 +458,14 @@ class TelegramChannel(BaseChannel):
         """Repeatedly send 'typing' action until cancelled."""
         try:
             while self._app:
-                await self._app.bot.send_chat_action(
-                    chat_id=int(chat_id), action="typing"
-                )
+                await self._app.bot.send_chat_action(chat_id=int(chat_id), action="typing")
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
 
-    async def _on_error(
-        self, update: object, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
         logger.error("Telegram error: {}", context.error)
 

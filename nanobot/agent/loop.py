@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Union
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.evolution import EvolutionEngine
 from nanobot.agent.memory.graph_store import GraphMemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.token_budget import TokenBudgetEstimator
@@ -43,7 +42,6 @@ if TYPE_CHECKING:
     from nanobot.config.schema import (
         ChannelsConfig,
         ExecToolConfig,
-        SelfEvolutionConfig,
     )
     from nanobot.cron.service import CronService
 
@@ -79,9 +77,8 @@ class AgentLoop:
         persistence_manager: PersistenceManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
-        self_evolution_config: SelfEvolutionConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, SelfEvolutionConfig
+        from nanobot.config.schema import ExecToolConfig
 
         self.bus = bus
         self.channels_config = channels_config
@@ -97,7 +94,6 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
-        self.self_evolution_config = self_evolution_config or SelfEvolutionConfig()
 
         self.context = ContextBuilder(workspace)
         self.persistence = persistence_manager or PersistenceManager(workspace)
@@ -129,18 +125,7 @@ class AgentLoop:
         # Session processing state for interruptible handling
         self._session_tasks: dict[str, asyncio.Task] = {}  # session_key -> Task
         self._session_cancel_events: dict[str, asyncio.Event] = {}  # session_key -> Event
-        self._evolution_tasks: set[asyncio.Task] = set()
         self.workspace_tools = WorkspaceToolRuntime(self.workspace, self.tools)
-        self.evolution = (
-            EvolutionEngine(
-                workspace=self.workspace,
-                provider=self.provider,
-                model=self.model,
-                min_confidence=self.self_evolution_config.min_confidence,
-            )
-            if self.self_evolution_config.enabled
-            else None
-        )
         # Task persistence is now part of persistence
         self._register_default_tools()
 
@@ -523,369 +508,6 @@ class AgentLoop:
         else:
             return self.sessions.get_or_create(key)  # type: ignore
 
-    def _evolution_log_path(self) -> Path:
-        if self.evolution:
-            return self.evolution.log_file
-        return self.workspace / "evolution" / "proposals.jsonl"
-
-    def _read_evolution_records(self) -> list[dict[str, Any]]:
-        path = self._evolution_log_path()
-        if not path.exists():
-            return []
-        records: list[dict[str, Any]] = []
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict):
-                records.append(item)
-        return records
-
-    def _append_evolution_record(self, record: dict[str, Any]) -> None:
-        path = self._evolution_log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    def _collect_proposals(self) -> list[dict[str, Any]]:
-        proposals: dict[str, dict[str, Any]] = {}
-        for rec in self._read_evolution_records():
-            pid = rec.get("id")
-            if not isinstance(pid, str) or not pid:
-                continue
-            rtype = rec.get("type")
-            if rtype == "proposal":
-                proposals[pid] = dict(rec)
-                continue
-            if pid not in proposals:
-                continue
-            if rtype == "apply":
-                proposals[pid]["status"] = rec.get("status", proposals[pid].get("status"))
-                proposals[pid]["auto_applied"] = rec.get("auto_applied", [])
-            elif rtype == "decision":
-                proposals[pid]["status"] = rec.get("status", proposals[pid].get("status"))
-                proposals[pid]["decision_reason"] = rec.get("reason", "")
-                proposals[pid]["decided_at"] = rec.get("created_at", "")
-
-        items = list(proposals.values())
-        items.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-        return items
-
-    async def _apply_evolution_actions(self, actions: list[dict[str, Any]]) -> list[dict[str, str]]:
-        results: list[dict[str, str]] = []
-        for action in actions:
-            kind = str(action.get("kind", ""))
-            name = str(action.get("name", ""))
-            content = str(action.get("content", ""))
-            description = str(action.get("description", ""))
-            if not kind or not name:
-                continue
-
-            if kind == "skill_update":
-                out = await self.tools.execute(
-                    "skill_manager",
-                    {
-                        "action": "update",
-                        "name": name,
-                        "description": description,
-                        "content": content,
-                    },
-                )
-                if out.startswith("Error: skill") and "not found" in out:
-                    out = await self.tools.execute(
-                        "skill_manager",
-                        {
-                            "action": "create",
-                            "name": name,
-                            "description": description or name,
-                            "content": content,
-                        },
-                    )
-                    kind = "skill_create"
-            elif kind == "skill_create":
-                out = await self.tools.execute(
-                    "skill_manager",
-                    {
-                        "action": "create",
-                        "name": name,
-                        "description": description or name,
-                        "content": content,
-                    },
-                )
-            elif kind == "skill_deprecate":
-                out = await self.tools.execute(
-                    "skill_manager", {"action": "deprecate", "name": name}
-                )
-            elif kind == "tool_update":
-                out = await self.tools.execute(
-                    "tool_manager",
-                    {"action": "update", "name": name, "content": content},
-                )
-                if out.startswith("Error: tool") and "not found" in out:
-                    out = await self.tools.execute(
-                        "tool_manager",
-                        {"action": "create", "name": name, "content": content},
-                    )
-                    kind = "tool_create"
-            elif kind == "tool_create":
-                out = await self.tools.execute(
-                    "tool_manager",
-                    {"action": "create", "name": name, "content": content},
-                )
-            elif kind == "tool_deprecate":
-                out = await self.tools.execute(
-                    "tool_manager", {"action": "deprecate", "name": name}
-                )
-            else:
-                out = f"Skipped: unknown kind '{kind}'"
-
-            results.append({"kind": kind, "name": name, "result": out})
-        return results
-
-    async def _handle_evolution_command(
-        self,
-        msg: InboundMessage,
-    ) -> OutboundMessage:
-        raw = msg.content.strip()
-        parts = raw.split(maxsplit=3)
-
-        if len(parts) == 1 or parts[1] in {"help", "-h", "--help"}:
-            content = (
-                "🧬 evolution commands:\n"
-                "/evolution list [N] — 查看最近提案\n"
-                "/evolution show <id> — 查看提案详情\n"
-                "/evolution approve <id> — 批准并执行提案\n"
-                "/evolution reject <id> [reason] — 拒绝提案"
-            )
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=content)
-
-        action = parts[1].lower()
-        proposals = self._collect_proposals()
-
-        if action == "list":
-            limit = 10
-            if len(parts) >= 3:
-                try:
-                    limit = max(1, int(parts[2]))
-                except ValueError:
-                    pass
-            if not proposals:
-                return OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content="No evolution proposals found.",
-                )
-            rows = ["Evolution proposals:"]
-            for p in proposals[:limit]:
-                rows.append(
-                    f"- {p.get('id', '-')} | {p.get('status', 'pending')} | conf={float(p.get('confidence', 0.0)):.2f} | actions={len(p.get('actions') or [])}"
-                )
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content="\n".join(rows)
-            )
-
-        if len(parts) < 3:
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="Usage: /evolution show|approve|reject <proposal_id>",
-            )
-
-        proposal_id = parts[2]
-        proposal = next((p for p in proposals if p.get("id") == proposal_id), None)
-        if not proposal:
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=f"Proposal not found: {proposal_id}",
-            )
-
-        if action == "show":
-            lines = [
-                f"Proposal: {proposal_id}",
-                f"- status: {proposal.get('status', 'pending')}",
-                f"- confidence: {float(proposal.get('confidence', 0.0)):.2f}",
-                f"- created_at: {proposal.get('created_at', '-')}",
-            ]
-            summary = str(proposal.get("summary", "")).strip()
-            if summary:
-                lines.append(f"- summary: {summary}")
-            for idx, a in enumerate(proposal.get("actions") or [], start=1):
-                lines.append(
-                    f"  {idx}. {a.get('kind')}:{a.get('name')} (risk={a.get('risk', '-')})"
-                )
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines)
-            )
-
-        if action == "approve":
-            results = await self._apply_evolution_actions(proposal.get("actions") or [])
-            has_errors = any(str(r.get("result", "")).startswith("Error") for r in results)
-            status = "approved_with_errors" if has_errors else "approved"
-            self._append_evolution_record(
-                {
-                    "type": "decision",
-                    "id": proposal_id,
-                    "status": status,
-                    "created_at": datetime.now().isoformat(),
-                    "results": results,
-                }
-            )
-            lines = [f"Approved: {proposal_id} ({status})"]
-            for r in results:
-                head = str(r.get("result", "")).splitlines()[0]
-                lines.append(f"- {r.get('kind')}:{r.get('name')} -> {head}")
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines)
-            )
-
-        if action == "reject":
-            reason = parts[3] if len(parts) >= 4 else ""
-            self._append_evolution_record(
-                {
-                    "type": "decision",
-                    "id": proposal_id,
-                    "status": "rejected",
-                    "reason": reason,
-                    "created_at": datetime.now().isoformat(),
-                }
-            )
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content=f"Rejected: {proposal_id}",
-            )
-
-        return OutboundMessage(
-            channel=msg.channel,
-            chat_id=msg.chat_id,
-            content=f"Unknown evolution action: {action}",
-        )
-
-    def _trigger_self_evolution(
-        self,
-        msg: InboundMessage,
-        final_content: str,
-        tools_used: list[str],
-        all_msgs: list[dict[str, Any]],
-    ) -> None:
-        """Launch async self-evolution analysis without blocking user response."""
-        if not self.evolution:
-            return
-        if msg.channel == "system":
-            return
-        if msg.content.strip().startswith("/"):
-            return
-
-        task = asyncio.create_task(
-            self._run_self_evolution(msg, final_content, tools_used, all_msgs)
-        )
-        self._evolution_tasks.add(task)
-        task.add_done_callback(self._evolution_tasks.discard)
-
-    async def _run_self_evolution(
-        self,
-        msg: InboundMessage,
-        final_content: str,
-        tools_used: list[str],
-        all_msgs: list[dict[str, Any]],
-    ) -> None:
-        """Generate and optionally apply safe evolution proposals."""
-        if not self.evolution:
-            return
-
-        try:
-            proposal = await self.evolution.propose(
-                user_message=msg.content,
-                final_response=final_content,
-                tools_used=tools_used,
-                messages=all_msgs,
-                session_key=msg.session_key,
-            )
-            if not proposal:
-                return
-
-            if self.self_evolution_config.mode == "auto_safe":
-                await self._apply_safe_evolution_actions(proposal)
-
-            if self.self_evolution_config.notify:
-                text = self._format_evolution_notice(proposal)
-                await self.bus.publish_outbound(
-                    OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=text,
-                        metadata={"_evolution": True},
-                    )
-                )
-        except Exception:
-            logger.exception("Self-evolution failed")
-
-    async def _apply_safe_evolution_actions(self, proposal: dict[str, Any]) -> None:
-        """Apply low-risk actions automatically via tool manager skills."""
-        actions = proposal.get("actions") or []
-        applied: list[dict[str, Any]] = []
-
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            if action.get("risk") != "low":
-                continue
-
-            kind = str(action.get("kind", ""))
-            name = str(action.get("name", ""))
-            content = str(action.get("content", ""))
-            description = str(action.get("description", ""))
-            if not kind or not name:
-                continue
-
-            if kind == "skill_update":
-                result = await self.tools.execute(
-                    "skill_manager",
-                    {
-                        "action": "update",
-                        "name": name,
-                        "description": description,
-                        "content": content,
-                    },
-                )
-                if result.startswith("Error: skill") and "not found" in result:
-                    result = await self.tools.execute(
-                        "skill_manager",
-                        {
-                            "action": "create",
-                            "name": name,
-                            "description": description or name,
-                            "content": content,
-                        },
-                    )
-                    kind = "skill_create"
-                applied.append({"kind": kind, "name": name, "result": result})
-
-        proposal["auto_applied"] = applied
-        proposal["status"] = "auto_applied" if applied else proposal.get("status", "pending")
-        evolution_engine = self.evolution
-        if evolution_engine is not None:
-            evolution_engine.append_log({"type": "apply", **proposal})
-
-    @staticmethod
-    def _format_evolution_notice(proposal: dict[str, Any]) -> str:
-        actions = proposal.get("actions") or []
-        auto_applied = proposal.get("auto_applied") or []
-        lines = [
-            "[Self-Evolution] 已生成改进提案",
-            f"- id: {proposal.get('id', '-')}",
-            f"- confidence: {proposal.get('confidence', 0):.2f}",
-            f"- actions: {len(actions)}",
-        ]
-        if auto_applied:
-            lines.append(f"- auto applied: {len(auto_applied)}")
-        return "\n".join(lines)
-
     async def _save_session(self, session: Session) -> None:
         """Save a session, handling both sync and async managers."""
         if self._using_async_sessions:
@@ -929,8 +551,6 @@ class AgentLoop:
 
         # Slash commands
         cmd = msg.content.strip().lower()
-        if cmd.startswith("/evolution"):
-            return await self._handle_evolution_command(msg)
         if cmd == "/new":
             lock = self._get_consolidation_lock(session.key)
             self._consolidating.add(session.key)
@@ -967,7 +587,7 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content="🐈 nanobot commands:\n/new — Start a new conversation\n/status — Show current context info\n/evolution — Manage self-evolution proposals\n/help — Show available commands",
+                content="🐈 nanobot commands:\n/new — Start a new conversation\n/status — Show current context info\n/help — Show available commands",
             )
 
         if cmd == "/status":
@@ -1009,8 +629,6 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         await self._save_session(session)
-
-        self._trigger_self_evolution(msg, final_content, tools_used, all_msgs)
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -1299,9 +917,6 @@ class AgentLoop:
 
         # Slash commands
         cmd = msg.content.strip().lower()
-        if cmd.startswith("/evolution"):
-            await self.persistence.complete_task(session_key)
-            return await self._handle_evolution_command(msg)
         if cmd == "/new":
             lock = self._get_consolidation_lock(session.key)
             self._consolidating.add(session.key)
@@ -1340,7 +955,7 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content="🐈 nanobot commands:\n/new — Start a new conversation\n/status — Show current context info\n/evolution — Manage self-evolution proposals\n/help — Show available commands",
+                content="🐈 nanobot commands:\n/new — Start a new conversation\n/status — Show current context info\n/help — Show available commands",
             )
 
         if cmd == "/status":
@@ -1408,8 +1023,6 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         await self._save_session(session)
-
-        self._trigger_self_evolution(msg, final_content, tools_used, all_msgs)
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
