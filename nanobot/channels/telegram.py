@@ -168,6 +168,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("status", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
+        self._app.add_handler(CommandHandler("evolution", self._forward_command))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -321,7 +322,8 @@ class TelegramChannel(BaseChannel):
         await update.message.reply_text(
             f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
             "Send me a message and I'll respond!\n"
-            "Type /help to see available commands."
+            "Type /help to see available commands.\n"
+            "Use /evolution to manage self-evolution proposals."
         )
 
     async def _on_help(
@@ -334,6 +336,7 @@ class TelegramChannel(BaseChannel):
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
             "/status — Show current context info\n"
+            "/evolution — Manage self-evolution proposals\n"
             "/help — Show available commands"
         )
 

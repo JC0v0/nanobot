@@ -89,14 +89,13 @@ class Session:
     def get_history_by_tokens(
         self,
         max_tokens: int = 64000,
-        keep_last: int = 5,
     ) -> list[dict[str, Any]]:
-        """Return unconsolidated messages within token limit, preserving recent messages."""
+        """Return unconsolidated messages within token limit (latest-first packing)."""
         if tiktoken is None:
             logger.warning(
                 "tiktoken not available, falling back to message count limit"
             )
-            return self.get_history(max_messages=keep_last)
+            return self.get_history(max_messages=50)
 
         try:
             encoding = tiktoken.get_encoding("cl100k_base")
@@ -104,7 +103,7 @@ class Session:
             logger.warning(
                 "Failed to load tiktoken encoding, falling back to message count"
             )
-            return self.get_history(max_messages=keep_last)
+            return self.get_history(max_messages=50)
 
         unconsolidated = self.messages[self.last_consolidated :]
 
@@ -130,11 +129,7 @@ class Session:
 
             msg_tokens = self._count_message_tokens(entry, encoding)
 
-            # Always keep at least keep_last messages
-            if len(result) < keep_last:
-                result.insert(0, entry)
-                total_tokens += msg_tokens
-            elif total_tokens + msg_tokens <= max_tokens:
+            if total_tokens + msg_tokens <= max_tokens:
                 result.insert(0, entry)
                 total_tokens += msg_tokens
             else:

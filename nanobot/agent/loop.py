@@ -6,14 +6,17 @@ import asyncio
 import json
 import re
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Union
 
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.evolution import EvolutionEngine
 from nanobot.agent.memory import GraphMemoryStore as MemoryStore
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.token_budget import TokenBudgetEstimator
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import (
     EditFileTool,
@@ -24,17 +27,24 @@ from nanobot.agent.tools.filesystem import (
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.skill_manager import SkillManagerTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.tool_manager import ToolManagerTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.workspace_runtime import WorkspaceToolRuntime
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
-from nanobot.session.store import PersistenceManager, Session
 from nanobot.session.store import PersistenceManager
+from nanobot.session.store import Session
 from nanobot.session.task_store import TaskProgress, TaskState
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        ExecToolConfig,
+        SelfEvolutionConfig,
+    )
     from nanobot.cron.service import CronService
 
 
@@ -59,9 +69,8 @@ class AgentLoop:
         max_iterations: int = 40,
         temperature: float = 0.1,
         max_tokens: int = 4096,
-        memory_tokens: int = 64000,
-        memory_keep_last: int = 5,
-        memory_window: int = 20,
+        tokens_window: int = 64000,
+        memory_window: int | None = None,
         brave_api_key: str | None = None,
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
@@ -70,8 +79,9 @@ class AgentLoop:
         persistence_manager: PersistenceManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        self_evolution_config: SelfEvolutionConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ExecToolConfig, SelfEvolutionConfig
 
         self.bus = bus
         self.channels_config = channels_config
@@ -81,13 +91,15 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.memory_tokens = memory_tokens
-        self.memory_keep_last = memory_keep_last
-        self.memory_window = memory_window
+        self.tokens_window = max(1, tokens_window)
+        self.consolidation_window = (
+            max(2, memory_window) if memory_window is not None else 10
+        )
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.self_evolution_config = self_evolution_config or SelfEvolutionConfig()
 
         self.context = ContextBuilder(workspace)
         self.persistence = persistence_manager or PersistenceManager(workspace)
@@ -112,18 +124,29 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._token_budget = TokenBudgetEstimator()
+        self._last_context_tokens: dict[str, int] = {}
         self._consolidating: set[str] = (
             set()
         )  # Session keys with consolidation in progress
-        self._consolidation_tasks: set[asyncio.Task] = (
-            set()
-        )  # Strong refs to in-flight tasks
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
         # Session processing state for interruptible handling
         self._session_tasks: dict[str, asyncio.Task] = {}  # session_key -> Task
         self._session_cancel_events: dict[
             str, asyncio.Event
         ] = {}  # session_key -> Event
+        self._evolution_tasks: set[asyncio.Task] = set()
+        self.workspace_tools = WorkspaceToolRuntime(self.workspace, self.tools)
+        self.evolution = (
+            EvolutionEngine(
+                workspace=self.workspace,
+                provider=self.provider,
+                model=self.model,
+                min_confidence=self.self_evolution_config.min_confidence,
+            )
+            if self.self_evolution_config.enabled
+            else None
+        )
         # Task persistence is now part of persistence
         self._register_default_tools()
 
@@ -141,10 +164,20 @@ class AgentLoop:
         )
         self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
+        self.tools.register(SkillManagerTool(workspace=self.workspace))
+        self.tools.register(
+            ToolManagerTool(
+                workspace=self.workspace,
+                reload_callback=self.workspace_tools.reload,
+            )
+        )
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        report = self.workspace_tools.reload()
+        if report["errors"]:
+            logger.warning("Workspace tools loaded with errors: {}", report["errors"])
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -354,6 +387,73 @@ class AgentLoop:
         if not lock.locked():
             self._consolidation_locks.pop(session_key, None)
 
+    async def _prepare_messages_with_preflight(
+        self,
+        session: Session,
+        msg: InboundMessage,
+        cancel_event: asyncio.Event | None = None,
+        max_rebuilds: int = 2,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Build context messages and compress memory if context tokens exceed window."""
+        rebuild_count = 0
+
+        while True:
+            if cancel_event and cancel_event.is_set():
+                raise asyncio.CancelledError()
+
+            history = session.get_history_by_tokens(
+                max_tokens=self.tokens_window,
+            )
+            initial_messages = self.context.build_messages(
+                history=history,
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+            )
+
+            context_tokens = self._token_budget.count_messages(
+                initial_messages, self.model
+            )
+            self._last_context_tokens[session.key] = context_tokens
+
+            if context_tokens <= self.tokens_window:
+                return history, initial_messages
+
+            if rebuild_count >= max_rebuilds:
+                logger.warning(
+                    "Context still over tokensWindow after {} rebuilds: {} > {}",
+                    rebuild_count,
+                    context_tokens,
+                    self.tokens_window,
+                )
+                return history, initial_messages
+
+            logger.info(
+                "Context over tokensWindow ({} > {}), consolidating memory (attempt {}/{})",
+                context_tokens,
+                self.tokens_window,
+                rebuild_count + 1,
+                max_rebuilds,
+            )
+
+            lock = self._get_consolidation_lock(session.key)
+            self._consolidating.add(session.key)
+            try:
+                async with lock:
+                    ok = await self._consolidate_memory(session)
+            finally:
+                self._consolidating.discard(session.key)
+                self._prune_consolidation_lock(session.key, lock)
+
+            if not ok:
+                logger.warning(
+                    "Memory consolidation failed during token preflight, continuing with current context"
+                )
+                return history, initial_messages
+
+            rebuild_count += 1
+
     async def _get_or_create_session(self, key: str) -> Session:
         """Get or create a session, handling both sync and async managers."""
         if self._using_async_sessions:
@@ -361,12 +461,389 @@ class AgentLoop:
         else:
             return self.sessions.get_or_create(key)  # type: ignore
 
+    def _evolution_log_path(self) -> Path:
+        if self.evolution:
+            return self.evolution.log_file
+        return self.workspace / "evolution" / "proposals.jsonl"
+
+    def _read_evolution_records(self) -> list[dict[str, Any]]:
+        path = self._evolution_log_path()
+        if not path.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+        return records
+
+    def _append_evolution_record(self, record: dict[str, Any]) -> None:
+        path = self._evolution_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _collect_proposals(self) -> list[dict[str, Any]]:
+        proposals: dict[str, dict[str, Any]] = {}
+        for rec in self._read_evolution_records():
+            pid = rec.get("id")
+            if not isinstance(pid, str) or not pid:
+                continue
+            rtype = rec.get("type")
+            if rtype == "proposal":
+                proposals[pid] = dict(rec)
+                continue
+            if pid not in proposals:
+                continue
+            if rtype == "apply":
+                proposals[pid]["status"] = rec.get(
+                    "status", proposals[pid].get("status")
+                )
+                proposals[pid]["auto_applied"] = rec.get("auto_applied", [])
+            elif rtype == "decision":
+                proposals[pid]["status"] = rec.get(
+                    "status", proposals[pid].get("status")
+                )
+                proposals[pid]["decision_reason"] = rec.get("reason", "")
+                proposals[pid]["decided_at"] = rec.get("created_at", "")
+
+        items = list(proposals.values())
+        items.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+        return items
+
+    async def _apply_evolution_actions(
+        self, actions: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        results: list[dict[str, str]] = []
+        for action in actions:
+            kind = str(action.get("kind", ""))
+            name = str(action.get("name", ""))
+            content = str(action.get("content", ""))
+            description = str(action.get("description", ""))
+            if not kind or not name:
+                continue
+
+            if kind == "skill_update":
+                out = await self.tools.execute(
+                    "skill_manager",
+                    {
+                        "action": "update",
+                        "name": name,
+                        "description": description,
+                        "content": content,
+                    },
+                )
+                if out.startswith("Error: skill") and "not found" in out:
+                    out = await self.tools.execute(
+                        "skill_manager",
+                        {
+                            "action": "create",
+                            "name": name,
+                            "description": description or name,
+                            "content": content,
+                        },
+                    )
+                    kind = "skill_create"
+            elif kind == "skill_create":
+                out = await self.tools.execute(
+                    "skill_manager",
+                    {
+                        "action": "create",
+                        "name": name,
+                        "description": description or name,
+                        "content": content,
+                    },
+                )
+            elif kind == "skill_deprecate":
+                out = await self.tools.execute(
+                    "skill_manager", {"action": "deprecate", "name": name}
+                )
+            elif kind == "tool_update":
+                out = await self.tools.execute(
+                    "tool_manager",
+                    {"action": "update", "name": name, "content": content},
+                )
+                if out.startswith("Error: tool") and "not found" in out:
+                    out = await self.tools.execute(
+                        "tool_manager",
+                        {"action": "create", "name": name, "content": content},
+                    )
+                    kind = "tool_create"
+            elif kind == "tool_create":
+                out = await self.tools.execute(
+                    "tool_manager",
+                    {"action": "create", "name": name, "content": content},
+                )
+            elif kind == "tool_deprecate":
+                out = await self.tools.execute(
+                    "tool_manager", {"action": "deprecate", "name": name}
+                )
+            else:
+                out = f"Skipped: unknown kind '{kind}'"
+
+            results.append({"kind": kind, "name": name, "result": out})
+        return results
+
+    async def _handle_evolution_command(
+        self,
+        msg: InboundMessage,
+    ) -> OutboundMessage:
+        raw = msg.content.strip()
+        parts = raw.split(maxsplit=3)
+
+        if len(parts) == 1 or parts[1] in {"help", "-h", "--help"}:
+            content = (
+                "🧬 evolution commands:\n"
+                "/evolution list [N] — 查看最近提案\n"
+                "/evolution show <id> — 查看提案详情\n"
+                "/evolution approve <id> — 批准并执行提案\n"
+                "/evolution reject <id> [reason] — 拒绝提案"
+            )
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content
+            )
+
+        action = parts[1].lower()
+        proposals = self._collect_proposals()
+
+        if action == "list":
+            limit = 10
+            if len(parts) >= 3:
+                try:
+                    limit = max(1, int(parts[2]))
+                except ValueError:
+                    pass
+            if not proposals:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="No evolution proposals found.",
+                )
+            rows = ["Evolution proposals:"]
+            for p in proposals[:limit]:
+                rows.append(
+                    f"- {p.get('id', '-')} | {p.get('status', 'pending')} | conf={float(p.get('confidence', 0.0)):.2f} | actions={len(p.get('actions') or [])}"
+                )
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content="\n".join(rows)
+            )
+
+        if len(parts) < 3:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Usage: /evolution show|approve|reject <proposal_id>",
+            )
+
+        proposal_id = parts[2]
+        proposal = next((p for p in proposals if p.get("id") == proposal_id), None)
+        if not proposal:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Proposal not found: {proposal_id}",
+            )
+
+        if action == "show":
+            lines = [
+                f"Proposal: {proposal_id}",
+                f"- status: {proposal.get('status', 'pending')}",
+                f"- confidence: {float(proposal.get('confidence', 0.0)):.2f}",
+                f"- created_at: {proposal.get('created_at', '-')}",
+            ]
+            summary = str(proposal.get("summary", "")).strip()
+            if summary:
+                lines.append(f"- summary: {summary}")
+            for idx, a in enumerate(proposal.get("actions") or [], start=1):
+                lines.append(
+                    f"  {idx}. {a.get('kind')}:{a.get('name')} (risk={a.get('risk', '-')})"
+                )
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines)
+            )
+
+        if action == "approve":
+            results = await self._apply_evolution_actions(proposal.get("actions") or [])
+            has_errors = any(
+                str(r.get("result", "")).startswith("Error") for r in results
+            )
+            status = "approved_with_errors" if has_errors else "approved"
+            self._append_evolution_record(
+                {
+                    "type": "decision",
+                    "id": proposal_id,
+                    "status": status,
+                    "created_at": datetime.now().isoformat(),
+                    "results": results,
+                }
+            )
+            lines = [f"Approved: {proposal_id} ({status})"]
+            for r in results:
+                head = str(r.get("result", "")).splitlines()[0]
+                lines.append(f"- {r.get('kind')}:{r.get('name')} -> {head}")
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines)
+            )
+
+        if action == "reject":
+            reason = parts[3] if len(parts) >= 4 else ""
+            self._append_evolution_record(
+                {
+                    "type": "decision",
+                    "id": proposal_id,
+                    "status": "rejected",
+                    "reason": reason,
+                    "created_at": datetime.now().isoformat(),
+                }
+            )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Rejected: {proposal_id}",
+            )
+
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=f"Unknown evolution action: {action}",
+        )
+
+    def _trigger_self_evolution(
+        self,
+        msg: InboundMessage,
+        final_content: str,
+        tools_used: list[str],
+        all_msgs: list[dict[str, Any]],
+    ) -> None:
+        """Launch async self-evolution analysis without blocking user response."""
+        if not self.evolution:
+            return
+        if msg.channel == "system":
+            return
+        if msg.content.strip().startswith("/"):
+            return
+
+        task = asyncio.create_task(
+            self._run_self_evolution(msg, final_content, tools_used, all_msgs)
+        )
+        self._evolution_tasks.add(task)
+        task.add_done_callback(self._evolution_tasks.discard)
+
+    async def _run_self_evolution(
+        self,
+        msg: InboundMessage,
+        final_content: str,
+        tools_used: list[str],
+        all_msgs: list[dict[str, Any]],
+    ) -> None:
+        """Generate and optionally apply safe evolution proposals."""
+        if not self.evolution:
+            return
+
+        try:
+            proposal = await self.evolution.propose(
+                user_message=msg.content,
+                final_response=final_content,
+                tools_used=tools_used,
+                messages=all_msgs,
+                session_key=msg.session_key,
+            )
+            if not proposal:
+                return
+
+            if self.self_evolution_config.mode == "auto_safe":
+                await self._apply_safe_evolution_actions(proposal)
+
+            if self.self_evolution_config.notify:
+                text = self._format_evolution_notice(proposal)
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=text,
+                        metadata={"_evolution": True},
+                    )
+                )
+        except Exception:
+            logger.exception("Self-evolution failed")
+
+    async def _apply_safe_evolution_actions(self, proposal: dict[str, Any]) -> None:
+        """Apply low-risk actions automatically via tool manager skills."""
+        actions = proposal.get("actions") or []
+        applied: list[dict[str, Any]] = []
+
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if action.get("risk") != "low":
+                continue
+
+            kind = str(action.get("kind", ""))
+            name = str(action.get("name", ""))
+            content = str(action.get("content", ""))
+            description = str(action.get("description", ""))
+            if not kind or not name:
+                continue
+
+            if kind == "skill_update":
+                result = await self.tools.execute(
+                    "skill_manager",
+                    {
+                        "action": "update",
+                        "name": name,
+                        "description": description,
+                        "content": content,
+                    },
+                )
+                if result.startswith("Error: skill") and "not found" in result:
+                    result = await self.tools.execute(
+                        "skill_manager",
+                        {
+                            "action": "create",
+                            "name": name,
+                            "description": description or name,
+                            "content": content,
+                        },
+                    )
+                    kind = "skill_create"
+                applied.append({"kind": kind, "name": name, "result": result})
+
+        proposal["auto_applied"] = applied
+        proposal["status"] = (
+            "auto_applied" if applied else proposal.get("status", "pending")
+        )
+        evolution_engine = self.evolution
+        if evolution_engine is not None:
+            evolution_engine.append_log({"type": "apply", **proposal})
+
+    @staticmethod
+    def _format_evolution_notice(proposal: dict[str, Any]) -> str:
+        actions = proposal.get("actions") or []
+        auto_applied = proposal.get("auto_applied") or []
+        lines = [
+            "[Self-Evolution] 已生成改进提案",
+            f"- id: {proposal.get('id', '-')}",
+            f"- confidence: {proposal.get('confidence', 0):.2f}",
+            f"- actions: {len(actions)}",
+        ]
+        if auto_applied:
+            lines.append(f"- auto applied: {len(auto_applied)}")
+        return "\n".join(lines)
+
     async def _save_session(self, session: Session) -> None:
         """Save a session, handling both sync and async managers."""
         if self._using_async_sessions:
             await self.sessions.save(session)  # type: ignore
         else:
-            self.sessions.save(session)  # type: ignore
+            result = self.sessions.save(session)  # type: ignore
+            if asyncio.iscoroutine(result):
+                await result
 
     async def _process_message(
         self,
@@ -386,15 +863,8 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = await self._get_or_create_session(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-            history = session.get_history_by_tokens(
-                max_tokens=self.memory_tokens,
-                keep_last=self.memory_keep_last,
-            )
-            messages = self.context.build_messages(
-                history=history,
-                current_message=msg.content,
-                channel=channel,
-                chat_id=chat_id,
+            history, messages = await self._prepare_messages_with_preflight(
+                session, msg
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -415,6 +885,8 @@ class AgentLoop:
 
         # Slash commands
         cmd = msg.content.strip().lower()
+        if cmd.startswith("/evolution"):
+            return await self._handle_evolution_command(msg)
         if cmd == "/new":
             lock = self._get_consolidation_lock(session.key)
             self._consolidating.add(session.key)
@@ -451,49 +923,20 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content="🐈 nanobot commands:\n/new — Start a new conversation\n/status — Show current context info\n/help — Show available commands",
+                content="🐈 nanobot commands:\n/new — Start a new conversation\n/status — Show current context info\n/evolution — Manage self-evolution proposals\n/help — Show available commands",
             )
 
         if cmd == "/status":
             return await self._handle_status_command(session, msg)
-
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if (
-            unconsolidated >= self.memory_window
-            and session.key not in self._consolidating
-        ):
-            self._consolidating.add(session.key)
-            lock = self._get_consolidation_lock(session.key)
-
-            async def _consolidate_and_unlock():
-                try:
-                    async with lock:
-                        await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-                    self._prune_consolidation_lock(session.key, lock)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
-
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history_by_tokens(
-            max_tokens=self.memory_tokens,
-            keep_last=self.memory_keep_last,
-        )
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
+        history, initial_messages = await self._prepare_messages_with_preflight(
+            session,
+            msg,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -509,7 +952,7 @@ class AgentLoop:
                 )
             )
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages,
             on_progress=on_progress or _bus_progress,
         )
@@ -524,6 +967,8 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         await self._save_session(session)
+
+        self._trigger_self_evolution(msg, final_content, tools_used, all_msgs)
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -567,7 +1012,7 @@ class AgentLoop:
             self.provider,
             self.model,
             archive_all=archive_all,
-            memory_window=self.memory_window,
+            memory_window=self.consolidation_window,
         )
 
     async def _handle_status_command(
@@ -584,14 +1029,13 @@ class AgentLoop:
             "📊 **Context Status**",
             "",
             "**Token Quota:**",
-            f"- memory_tokens: {self.memory_tokens:,}",
-            f"- memory_keep_last: {self.memory_keep_last}",
-            f"- memory_window: {self.memory_window}",
+            f"- tokensWindow: {self.tokens_window:,}",
             "",
             "**Current Session:**",
             f"- Total messages: {msg_count}",
             f"- Unconsolidated: {unconsolidated}",
             f"- Last consolidated: {session.last_consolidated}",
+            f"- Last context tokens: {self._last_context_tokens.get(session.key, 0):,}",
             "",
             "**Memory Files:**",
         ]
@@ -641,7 +1085,7 @@ class AgentLoop:
         """Add a user message to the session without processing it."""
         from datetime import datetime
 
-        entry = {
+        entry: dict[str, Any] = {
             "role": "user",
             "content": msg.content,
             "timestamp": datetime.now().isoformat(),
@@ -670,15 +1114,9 @@ class AgentLoop:
         key = f"{channel}:{chat_id}"
         session = await self._get_or_create_session(key)
         self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
-        history = session.get_history_by_tokens(
-            max_tokens=self.memory_tokens,
-            keep_last=self.memory_keep_last,
-        )
-        messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            channel=channel,
-            chat_id=chat_id,
+        history, messages = await self._prepare_messages_with_preflight(
+            session,
+            msg,
         )
         final_content, _, all_msgs = await self._run_agent_loop(messages)
         self._save_turn(session, all_msgs, 1 + len(history))
@@ -808,9 +1246,11 @@ class AgentLoop:
             if current_task == asyncio.current_task():
                 self._session_tasks.pop(session_key, None)
                 # Ensure cancel_event is set before removing to avoid "Task was destroyed" warning
-                cancel_event = self._session_cancel_events.pop(session_key, None)
-                if cancel_event and not cancel_event.is_set():
-                    cancel_event.set()
+                pending_cancel_event = self._session_cancel_events.pop(
+                    session_key, None
+                )
+                if pending_cancel_event and not pending_cancel_event.is_set():
+                    pending_cancel_event.set()
 
     async def _process_single_turn(
         self,
@@ -831,6 +1271,9 @@ class AgentLoop:
 
         # Slash commands
         cmd = msg.content.strip().lower()
+        if cmd.startswith("/evolution"):
+            await self.persistence.complete_task(session_key)
+            return await self._handle_evolution_command(msg)
         if cmd == "/new":
             lock = self._get_consolidation_lock(session.key)
             self._consolidating.add(session.key)
@@ -869,7 +1312,7 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
-                content="🐈 nanobot commands:\n/new — Start a new conversation\n/status — Show current context info\n/help — Show available commands",
+                content="🐈 nanobot commands:\n/new — Start a new conversation\n/status — Show current context info\n/evolution — Manage self-evolution proposals\n/help — Show available commands",
             )
 
         if cmd == "/status":
@@ -880,28 +1323,6 @@ class AgentLoop:
         if cancel_event and cancel_event.is_set():
             raise asyncio.CancelledError()
 
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if (
-            unconsolidated >= self.memory_window
-            and session.key not in self._consolidating
-        ):
-            self._consolidating.add(session.key)
-            lock = self._get_consolidation_lock(session.key)
-
-            async def _consolidate_and_unlock():
-                try:
-                    async with lock:
-                        await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-                    self._prune_consolidation_lock(session.key, lock)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
-
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
-
         # Check cancellation before building context
         if cancel_event and cancel_event.is_set():
             raise asyncio.CancelledError()
@@ -911,20 +1332,13 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        history = session.get_history_by_tokens(
-            max_tokens=self.memory_tokens,
-            keep_last=self.memory_keep_last,
-        )
-
         # Update task progress
         await self._update_task_progress(session_key, TaskProgress.BUILDING_CONTEXT)
 
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel,
-            chat_id=msg.chat_id,
+        history, initial_messages = await self._prepare_messages_with_preflight(
+            session,
+            msg,
+            cancel_event=cancel_event,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -969,6 +1383,8 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         await self._save_session(session)
 
+        self._trigger_self_evolution(msg, final_content, tools_used, all_msgs)
+
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
                 return None
@@ -1007,7 +1423,7 @@ class AgentLoop:
             sender_id=last_inbound.get("sender_id", "user"),
             chat_id=last_inbound.get("chat_id", "direct"),
             content=last_inbound.get("content", ""),
-            media=last_inbound.get("media"),
+            media=last_inbound.get("media") or [],
             metadata=last_inbound.get("metadata", {}),
         )
 

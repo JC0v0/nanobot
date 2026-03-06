@@ -15,43 +15,43 @@ from nanobot.agent.skills import SkillsLoader
 class ContextBuilder:
     """
     Builds the context (system prompt + messages) for the agent.
-    
+
     Assembles bootstrap files, memory, skills, and conversation history
     into a coherent prompt for the LLM.
     """
-    
+
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
-    
+
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
-    
+
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
-        
+
         Args:
             skill_names: Optional list of skills to include.
-        
+
         Returns:
             Complete system prompt.
         """
         parts = []
-        
+
         # Core identity
         parts.append(self._get_identity())
-        
+
         # Bootstrap files
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
-        
+
         # Memory context
         memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
-        
+
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
         always_skills = self.skills.get_always_skills()
@@ -59,7 +59,7 @@ class ContextBuilder:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
-        
+
         # 2. Available skills: only show summary (agent uses read_file to load)
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
@@ -69,15 +69,15 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
 {skills_summary}""")
-        
+
         return "\n\n---\n\n".join(parts)
-    
+
     def _get_identity(self) -> str:
         """Get the core identity section."""
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
-        
+
         return f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant. 
@@ -90,6 +90,7 @@ Your workspace is at: {workspace_path}
 - Long-term memory: {workspace_path}/memory/MEMORY.md
 - History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+- Custom tools: {workspace_path}/tools/{{tool-file}}.py
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
 
@@ -102,7 +103,13 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
 ## Memory
 - Remember important facts: write to {workspace_path}/memory/MEMORY.md
-- Recall past events: grep {workspace_path}/memory/HISTORY.md"""
+- Recall past events: grep {workspace_path}/memory/HISTORY.md
+
+## Skill-First Evolution
+- Improve behavior through skills in {workspace_path}/skills/ before changing global prompts.
+- Prefer small, reversible skill updates that address one repeated failure at a time.
+- When repeated work is procedural, evolve a workspace tool under {workspace_path}/tools/ and reload tools.
+- Keep builtin skills read-only; only write under workspace skills."""
 
     @staticmethod
     def _inject_runtime_context(
@@ -120,19 +127,19 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if isinstance(user_content, str):
             return f"{user_content}\n\n{block}"
         return [*user_content, {"type": "text", "text": block}]
-    
+
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
-        
+
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
-        
+
         return "\n\n".join(parts) if parts else ""
-    
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -168,7 +175,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             messages.append(processed_msg)
 
         # Current message (with optional image attachments)
-        user_content = self._build_user_content(current_message, media, image_detail="low")
+        user_content = self._build_user_content(
+            current_message, media, image_detail="low"
+        )
         user_content = self._inject_runtime_context(user_content, channel, chat_id)
         messages.append({"role": "user", "content": user_content})
 
@@ -200,31 +209,33 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                         # Use path from media field if available
                         if media_index < len(media_paths):
                             path = media_paths[media_index]
-                            new_content.append({
-                                "type": "text",
-                                "text": f"[Image: {path}]"
-                            })
+                            new_content.append(
+                                {"type": "text", "text": f"[Image: {path}]"}
+                            )
                             media_index += 1
                         else:
                             # No path available, just note that an image was present
-                            new_content.append({
-                                "type": "text",
-                                "text": "[Image: previously sent]"
-                            })
+                            new_content.append(
+                                {"type": "text", "text": "[Image: previously sent]"}
+                            )
                     elif part_type in ("input_image", "input_video", "input_file"):
                         # VolcEngine format - also try to use media paths
                         if media_index < len(media_paths):
                             path = media_paths[media_index]
-                            new_content.append({
-                                "type": "text",
-                                "text": f"[{part_type.replace('input_', '').capitalize()}: {path}]"
-                            })
+                            new_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"[{part_type.replace('input_', '').capitalize()}: {path}]",
+                                }
+                            )
                             media_index += 1
                         else:
-                            new_content.append({
-                                "type": "text",
-                                "text": f"[{part_type.replace('input_', '').capitalize()} omitted to save tokens]"
-                            })
+                            new_content.append(
+                                {
+                                    "type": "text",
+                                    "text": f"[{part_type.replace('input_', '').capitalize()} omitted to save tokens]",
+                                }
+                            )
                     else:
                         # Keep non-image parts
                         new_content.append(part)
@@ -235,7 +246,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         return msg
 
-    def _build_user_content(self, text: str, media: list[str] | None, image_detail: str = "low") -> str | list[dict[str, Any]]:
+    def _build_user_content(
+        self, text: str, media: list[str] | None, image_detail: str = "low"
+    ) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images.
 
         Args:
@@ -253,45 +266,49 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             if not p.is_file() or not mime or not mime.startswith("image/"):
                 continue
             b64 = base64.b64encode(p.read_bytes()).decode()
-            images.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime};base64,{b64}",
-                    "detail": image_detail,
+            images.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{b64}",
+                        "detail": image_detail,
+                    },
                 }
-            })
+            )
 
         if not images:
             return text
         return images + [{"type": "text", "text": text}]
-    
+
     def add_tool_result(
         self,
         messages: list[dict[str, Any]],
         tool_call_id: str,
         tool_name: str,
-        result: str
+        result: str,
     ) -> list[dict[str, Any]]:
         """
         Add a tool result to the message list.
-        
+
         Args:
             messages: Current message list.
             tool_call_id: ID of the tool call.
             tool_name: Name of the tool.
             result: Tool execution result.
-        
+
         Returns:
             Updated message list.
         """
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "name": tool_name,
-            "content": result
-        })
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "content": result,
+            }
+        )
         return messages
-    
+
     def add_assistant_message(
         self,
         messages: list[dict[str, Any]],
@@ -301,13 +318,13 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
     ) -> list[dict[str, Any]]:
         """
         Add an assistant message to the message list.
-        
+
         Args:
             messages: Current message list.
             content: Message content.
             tool_calls: Optional tool calls.
             reasoning_content: Thinking output (Kimi, DeepSeek-R1, etc.).
-        
+
         Returns:
             Updated message list.
         """

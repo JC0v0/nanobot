@@ -13,3 +13,18 @@ This file documents non-obvious constraints and usage patterns.
 ## cron — Scheduled Reminders
 
 - Please refer to cron skill for usage.
+
+## skill_manager — Workspace Skill Evolution
+
+- Scope is restricted to `workspace/skills/`.
+- Supported actions: `list`, `read`, `create`, `update`, `deprecate`.
+- Do not edit builtin skills in `nanobot/skills/`.
+- Prefer `update` over creating duplicates.
+- Use `deprecate` instead of deleting skills to keep rollback options.
+
+## tool_manager — Workspace Tool Evolution
+
+- Scope is restricted to `workspace/tools/`.
+- Supported actions: `list`, `read`, `create`, `update`, `deprecate`, `reload`.
+- New tools must subclass `Tool` and expose valid name/description/parameters/execute.
+- Use `deprecate` to disable a tool file (renamed to `.disabled.py`) instead of deleting it.

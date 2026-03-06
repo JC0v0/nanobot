@@ -14,6 +14,7 @@ def get_config_path() -> Path:
 def get_data_dir() -> Path:
     """Get the nanobot data directory."""
     from nanobot.utils.helpers import get_data_path
+
     return get_data_path()
 
 
@@ -66,4 +67,25 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    # Move agents.defaults.memoryWindow -> agents.defaults.tokensWindow
+    agents = data.get("agents", {})
+    defaults = agents.get("defaults", {})
+    has_tokens_window = "tokensWindow" in defaults or "tokens_window" in defaults
+    if not has_tokens_window:
+        if "memoryWindow" in defaults:
+            defaults["tokensWindow"] = defaults["memoryWindow"]
+        elif "memory_window" in defaults:
+            defaults["tokensWindow"] = defaults["memory_window"]
+        elif "memoryTokens" in defaults:
+            defaults["tokensWindow"] = defaults["memoryTokens"]
+        elif "memory_tokens" in defaults:
+            defaults["tokensWindow"] = defaults["memory_tokens"]
+
+    defaults.pop("memoryWindow", None)
+    defaults.pop("memory_window", None)
+    defaults.pop("memoryTokens", None)
+    defaults.pop("memory_tokens", None)
+    defaults.pop("memoryKeepLast", None)
+    defaults.pop("memory_keep_last", None)
     return data

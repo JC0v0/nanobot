@@ -199,9 +199,7 @@ class AgentDefaults(Base):
     max_tokens: int = 8192
     temperature: float = 0.1
     max_tool_iterations: int = 40
-    memory_tokens: int = 64000
-    memory_keep_last: int = 5
-    memory_window: int = 20
+    tokens_window: int = 64000
 
 
 class AgentsConfig(Base):
@@ -299,11 +297,21 @@ class MCPServerConfig(Base):
     tool_timeout: int = 30  # Seconds before a tool call is cancelled
 
 
+class SelfEvolutionConfig(Base):
+    """Self-evolution behavior configuration."""
+
+    enabled: bool = True
+    mode: str = "propose"  # propose | auto_safe
+    min_confidence: float = 0.75
+    notify: bool = True
+
+
 class ToolsConfig(Base):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    self_evolution: SelfEvolutionConfig = Field(default_factory=SelfEvolutionConfig)
     restrict_to_workspace: bool = (
         False  # If true, restrict all tool access to workspace directory
     )
