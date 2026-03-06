@@ -140,16 +140,15 @@ async def _request_codex(
         else:
             response = await send_task
 
-        async with response:
-            if response.status_code != 200:
-                text = await response.aread()
-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
+        if response.status_code != 200:
+            text = await response.aread()
+            raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
 
-            # Check cancellation before consuming SSE
-            if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
-                raise asyncio.CancelledError()
+        # Check cancellation before consuming SSE
+        if cancel_event and hasattr(cancel_event, "is_set") and cancel_event.is_set():
+            raise asyncio.CancelledError()
 
-            return await _consume_sse(response, cancel_event=cancel_event)
+        return await _consume_sse(response, cancel_event=cancel_event)
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
