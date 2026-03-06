@@ -1,4 +1,4 @@
-"""Generate and persist self-evolution proposals."""
+"""Generate and persist self-evolution proposals - Learn from tasks."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from nanobot.providers.base import LLMProvider
 
 
 class EvolutionEngine:
-    """LLM-assisted proposal engine for skill/tool evolution."""
+    """Learn from task execution and create skill summaries."""
 
     def __init__(
         self,
         workspace: Path,
         provider: LLMProvider,
         model: str,
-        min_confidence: float = 0.7,
+        min_confidence: float = 0.6,
     ):
         self.workspace = workspace
         self.provider = provider
@@ -39,19 +39,18 @@ class EvolutionEngine:
         messages: list[dict[str, Any]],
         session_key: str,
     ) -> dict[str, Any] | None:
-        """Generate a structured proposal for skill/tool evolution."""
-        error_samples = self._extract_error_samples(messages)
+        """Analyze completed task and generate learning skill if valuable."""
+        tool_results = self._extract_tool_results(messages)
+        has_content = len(tool_results) > 0 or user_message.strip()
 
-        # Only trigger proposal if there are actual issues (errors or repeated failures)
-        has_errors = len(error_samples) > 0
-        if not has_errors:
+        if not has_content:
             return None
 
         prompt = self._build_prompt(
             user_message=user_message,
             final_response=final_response,
             tools_used=tools_used,
-            error_samples=error_samples,
+            tool_results=tool_results,
         )
 
         response = await self.provider.chat(
@@ -59,15 +58,17 @@ class EvolutionEngine:
                 {
                     "role": "system",
                     "content": (
-                        "You are an evolution reviewer for an AI agent. "
-                        "Return strict JSON only. Keep changes minimal and reversible."
+                        "You are a learning assistant for an AI agent. "
+                        "Analyze the task execution and create skills that capture "
+                        "valuable learnings, patterns, and solutions. "
+                        "Return strict JSON only."
                     ),
                 },
                 {"role": "user", "content": prompt},
             ],
             model=self.model,
-            temperature=0.1,
-            max_tokens=1200,
+            temperature=0.2,
+            max_tokens=1500,
         )
 
         payload = self._extract_json(response.content or "")
@@ -99,7 +100,7 @@ class EvolutionEngine:
                     "reason": str(action.get("reason", "")).strip(),
                     "content": str(action.get("content", "")).strip(),
                     "description": str(action.get("description", "")).strip(),
-                    "risk": self._risk_for_kind(kind),
+                    "risk": "low",
                 }
             )
 
@@ -126,12 +127,8 @@ class EvolutionEngine:
         if not 2 <= len(name) <= 63:
             return False
         if kind_lower.startswith("skill_"):
-            import re
-
             return bool(re.match(r"^[a-z0-9][a-z0-9-]{1,62}$", name))
         if kind_lower.startswith("tool_"):
-            import re
-
             return bool(re.match(r"^[a-z0-9][a-z0-9_]{1,63}$", name))
         return False
 
@@ -145,59 +142,81 @@ class EvolutionEngine:
         user_message: str,
         final_response: str,
         tools_used: list[str],
-        error_samples: list[str],
+        tool_results: list[dict[str, str]],
     ) -> str:
-        return (
-            "Analyze this completed task and propose minimal capability evolution.\n"
-            "Prefer updating existing skills/tools over creating new ones.\n"
-            "IMPORTANT name constraints:\n"
-            "  - For skill_*: use lowercase kebab-case (2-63 chars, a-z 0-9 - only)\n"
-            "  - For tool_*: use lowercase snake_case (2-64 chars, a-z 0-9 _ only)\n"
-            "IMPORTANT content format:\n"
-            "  - For tool_create/tool_update: content MUST be valid Python code that can be written to a .py file\n"
-            "  - For skill_create/skills_update: content MUST be valid markdown (SKILL.md format)\n"
-            "  - Do NOT write explanations or instructions in content, write the actual code/markdown\n"
-            "Output JSON with schema:\n"
-            "{\n"
-            '  "summary": "string",\n'
-            '  "confidence": 0.0,\n'
-            '  "actions": [{\n'
-            '    "kind": "skill_update|skill_create|skill_deprecate|tool_update|tool_create|tool_deprecate",\n'
-            '    "name": "string",\n'
-            '    "description": "string optional",\n'
-            '    "reason": "string explaining why this change is needed",\n'
-            '    "content": "full Python code for tools OR markdown for skills (NOT instructions)"\n'
-            "  }]\n"
-            "}\n\n"
-            f"User request:\n{user_message}\n\n"
-            f"Final response:\n{final_response}\n\n"
-            f"Tools used:\n{', '.join(tools_used) if tools_used else 'none'}\n\n"
-            "Tool errors:\n" + ("\n".join(error_samples) if error_samples else "none")
-        )
+        tool_results_text = ""
+        if tool_results:
+            lines = []
+            for r in tool_results:
+                tool = r.get("tool", "unknown")
+                content = r.get("content", "")[:300]
+                status = r.get("status", "unknown")
+                lines.append(f"- {tool} [{status}]: {content}")
+            tool_results_text = "\n".join(lines)
+
+        return f"""Analyze this completed task and extract valuable learnings.
+
+Create a skill that captures:
+1. **Problems encountered** - What issues or errors happened during execution?
+2. **Solutions found** - How were problems solved? What worked?
+3. **Patterns & insights** - Reusable patterns for similar future tasks
+4. **Gotchas & pitfalls** - Things to avoid or be careful about
+
+IMPORTANT:
+- Name must be lowercase kebab-case (e.g., `web-scraping-tips`, `api-error-handling`)
+- Content must be a complete SKILL.md in markdown format with YAML frontmatter
+- Focus on actionable learnings, not generic advice
+
+Output JSON:
+{{
+  "summary": "Brief description of what was learned",
+  "confidence": 0.0-1.0,
+  "actions": [{{
+    "kind": "skill_create",
+    "name": "learning-topic-name",
+    "description": "1-2 sentence description",
+    "reason": "Why this learning is valuable",
+    "content": "Full SKILL.md markdown content"
+  }}]
+}}
+
+User request:
+{user_message}
+
+Tools used:
+{", ".join(tools_used) if tools_used else "none"}
+
+Tool execution results:
+{tool_results_text if tool_results_text else "none"}
+
+Final response summary:
+{final_response[:500] if final_response else "none"}"""
 
     @staticmethod
-    def _extract_error_samples(messages: list[dict[str, Any]]) -> list[str]:
-        errors: list[str] = []
+    def _extract_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+        results = []
         for msg in messages:
             if msg.get("role") != "tool":
                 continue
-            content = msg.get("content")
-            if isinstance(content, str) and content.startswith("Error"):
-                errors.append(content[:240])
-        return errors[-5:]
+            tool_name = msg.get("name", "unknown")
+            content = msg.get("content", "")
+
+            is_error = isinstance(content, str) and content.startswith("Error")
+            status = "error" if is_error else "success"
+
+            results.append(
+                {
+                    "tool": tool_name,
+                    "content": content,
+                    "status": status,
+                }
+            )
+
+        return results[-10:]
 
     @staticmethod
     def _risk_for_kind(kind: str) -> str:
-        kind = kind.strip().lower()
-        mapping = {
-            "skill_update": "low",
-            "skill_create": "medium",
-            "skill_deprecate": "medium",
-            "tool_update": "medium",
-            "tool_create": "high",
-            "tool_deprecate": "medium",
-        }
-        return mapping.get(kind, "high")
+        return "low"
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any] | None:

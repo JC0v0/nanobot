@@ -94,9 +94,7 @@ class EmailConfig(Base):
     mark_seen: bool = True
     max_body_chars: int = 12000
     subject_prefix: str = "Re: "
-    allow_from: list[str] = Field(
-        default_factory=list
-    )  # Allowed sender email addresses
+    allow_from: list[str] = Field(default_factory=list)  # Allowed sender email addresses
 
 
 class MochatMentionConfig(Base):
@@ -158,9 +156,7 @@ class SlackConfig(Base):
     reply_in_thread: bool = True
     react_emoji: str = "eyes"
     group_policy: str = "mention"  # "mention", "open", "allowlist"
-    group_allow_from: list[str] = Field(
-        default_factory=list
-    )  # Allowed channel IDs if allowlist
+    group_allow_from: list[str] = Field(default_factory=list)  # Allowed channel IDs if allowlist
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
@@ -213,17 +209,13 @@ class ProviderConfig(Base):
 
     api_key: str = ""
     api_base: str | None = None
-    extra_headers: dict[str, str] | None = (
-        None  # Custom headers (e.g. APP-Code for AiHubMix)
-    )
+    extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
-    custom: ProviderConfig = Field(
-        default_factory=ProviderConfig
-    )  # Any OpenAI-compatible endpoint
+    custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -235,21 +227,15 @@ class ProvidersConfig(Base):
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
-    aihubmix: ProviderConfig = Field(
-        default_factory=ProviderConfig
-    )  # AiHubMix API gateway
+    aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(
         default_factory=ProviderConfig
     )  # SiliconFlow (硅基流动) API gateway
     volcengine: ProviderConfig = Field(
         default_factory=ProviderConfig
     )  # VolcEngine (火山引擎) API gateway
-    openai_codex: ProviderConfig = Field(
-        default_factory=ProviderConfig
-    )  # OpenAI Codex (OAuth)
-    github_copilot: ProviderConfig = Field(
-        default_factory=ProviderConfig
-    )  # Github Copilot (OAuth)
+    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
+    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
 
 class HeartbeatConfig(Base):
@@ -301,8 +287,8 @@ class SelfEvolutionConfig(Base):
     """Self-evolution behavior configuration."""
 
     enabled: bool = True
-    mode: str = "propose"  # propose | auto_safe
-    min_confidence: float = 0.9
+    mode: str = "auto_safe"  # propose | auto_safe
+    min_confidence: float = 0.6
     notify: bool = True
 
 
@@ -312,9 +298,7 @@ class ToolsConfig(Base):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     self_evolution: SelfEvolutionConfig = Field(default_factory=SelfEvolutionConfig)
-    restrict_to_workspace: bool = (
-        False  # If true, restrict all tool access to workspace directory
-    )
+    restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
