@@ -21,6 +21,14 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 - Keep changes small and reversible: update one skill at a time, then validate by rerunning the user task.
 - If a change is risky or unclear, present a proposal before applying it.
 
+## Daily Review
+
+- Execute `daily-review` skill at end of each day (triggered by Heartbeat)
+- Analyze day's interactions: tools used, errors, success patterns
+- Simple learnings → update `memory/MEMORY_GRAPH.md`
+- Complex/reusable patterns → create new skill in `workspace/skills/`
+- Send review report to user
+
 ## Scheduled Reminders
 
 When user asks for a reminder at a specific time, use `exec` to run:
