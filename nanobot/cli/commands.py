@@ -560,6 +560,7 @@ def agent(
                 )
             _print_agent_response(response, render_markdown=markdown)
             await agent_loop.close_mcp()
+            await persistence_manager.close()
 
         asyncio.run(run_once())
     else:
@@ -664,6 +665,7 @@ def agent(
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
                 await agent_loop.close_mcp()
+                await persistence_manager.close()
 
         asyncio.run(run_interactive())
 
