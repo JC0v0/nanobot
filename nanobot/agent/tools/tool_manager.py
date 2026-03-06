@@ -6,21 +6,30 @@ import re
 from pathlib import Path
 from typing import Any, Callable
 
+import yaml
+from loguru import logger
+
 from nanobot.agent.tools.base import Tool
+from nanobot.config.schema import MCPServerConfig
 
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 class ToolManagerTool(Tool):
-    """Manage workspace tools under workspace/tools."""
+    """Manage workspace tools under workspace/tools and MCP servers."""
 
     def __init__(
-        self, workspace: Path, reload_callback: Callable[[], dict[str, list[str]]]
+        self,
+        workspace: Path,
+        reload_callback: Callable[[], dict[str, list[str]]],
+        reload_mcp_callback: Callable[[], dict[str, Any]] | None = None,
     ):
         self.workspace = workspace
         self.tools_dir = workspace / "tools"
+        self.mcp_config_path = workspace / "mcp_servers.yaml"
         self._reload = reload_callback
+        self._reload_mcp = reload_mcp_callback
 
     @property
     def name(self) -> str:
@@ -29,8 +38,9 @@ class ToolManagerTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Manage workspace Python tools. Actions: list, read, create, update, "
-            "deprecate, reload. Files are limited to workspace/tools/."
+            "Manage workspace Python tools and MCP servers. Tool actions: list, read, create, "
+            "update, deprecate, reload. MCP actions: mcp_list, mcp_add, mcp_remove, mcp_reload. "
+            "Files are limited to workspace/tools/. MCP config stored in workspace/mcp_servers.yaml."
         )
 
     @property
@@ -40,12 +50,23 @@ class ToolManagerTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "read", "create", "update", "deprecate", "reload"],
+                    "enum": [
+                        "list",
+                        "read",
+                        "create",
+                        "update",
+                        "deprecate",
+                        "reload",
+                        "mcp_list",
+                        "mcp_add",
+                        "mcp_remove",
+                        "mcp_reload",
+                    ],
                 },
-                "name": {"type": "string", "description": "Tool file name without .py"},
+                "name": {"type": "string", "description": "Tool file name or MCP server name"},
                 "content": {
                     "type": "string",
-                    "description": "Full Python source code for create/update",
+                    "description": "Full Python source code for create/update, or MCP config YAML",
                 },
             },
             "required": ["action"],
@@ -70,14 +91,20 @@ class ToolManagerTool(Tool):
             return self._deprecate(name)
         if action == "reload":
             return self._reload_report()
+        if action == "mcp_list":
+            return self._mcp_list()
+        if action == "mcp_add":
+            return self._mcp_add(name, content)
+        if action == "mcp_remove":
+            return self._mcp_remove(name)
+        if action == "mcp_reload":
+            return self._mcp_reload()
         return f"Error: unsupported action '{action}'"
 
     def _list(self) -> str:
         self.tools_dir.mkdir(parents=True, exist_ok=True)
         files = sorted(
-            f
-            for f in self.tools_dir.glob("*.py")
-            if not f.name.endswith(".disabled.py")
+            f for f in self.tools_dir.glob("*.py") if not f.name.endswith(".disabled.py")
         )
         disabled = sorted(self.tools_dir.glob("*.disabled.py"))
         if not files and not disabled:
@@ -147,6 +174,105 @@ class ToolManagerTool(Tool):
         if errors:
             lines.append("Errors: " + " | ".join(errors))
         return "\n".join(lines)
+
+    def _load_mcp_config(self) -> dict[str, MCPServerConfig]:
+        if not self.mcp_config_path.exists():
+            return {}
+        try:
+            data = yaml.safe_load(self.mcp_config_path.read_text(encoding="utf-8"))
+            if not data:
+                return {}
+            result = {}
+            for name, cfg in data.items():
+                if isinstance(cfg, dict):
+                    result[name] = MCPServerConfig(**cfg)
+            return result
+        except Exception as e:
+            logger.warning("Failed to load MCP config: {}", e)
+            return {}
+
+    def _save_mcp_config(self, servers: dict[str, MCPServerConfig]) -> None:
+        data = {}
+        for name, cfg in servers.items():
+            data[name] = {
+                "command": cfg.command,
+                "args": cfg.args,
+                "env": cfg.env,
+                "url": cfg.url,
+                "headers": cfg.headers,
+                "tool_timeout": cfg.tool_timeout,
+            }
+        self.mcp_config_path.write_text(
+            yaml.dump(data, default_flow_style=False, sort_keys=False),
+            encoding="utf-8",
+        )
+
+    def _mcp_list(self) -> str:
+        servers = self._load_mcp_config()
+        if not servers:
+            return "No MCP servers configured. Use mcp_add to add one."
+        lines = ["MCP servers:"]
+        for name, cfg in servers.items():
+            if cfg.url:
+                lines.append(f"- {name}: url={cfg.url}")
+            else:
+                lines.append(f"- {name}: {cfg.command} {' '.join(cfg.args)}")
+        return "\n".join(lines)
+
+    def _mcp_add(self, name: str | None, content: str | None) -> str:
+        if not name:
+            return "Error: name is required for mcp_add"
+        servers = self._load_mcp_config()
+        if name in servers:
+            return f"Error: MCP server '{name}' already exists. Use mcp_remove first."
+        if not content:
+            content = self._mcp_template(name)
+        try:
+            cfg_data = yaml.safe_load(content)
+            if not isinstance(cfg_data, dict):
+                return "Error: invalid MCP config format, expected YAML dict"
+            servers[name] = MCPServerConfig(**cfg_data)
+            self._save_mcp_config(servers)
+            result = self._mcp_reload()
+            return f"Added MCP server: {name}\n{result}"
+        except Exception as e:
+            return f"Error: failed to add MCP server: {e}"
+
+    def _mcp_remove(self, name: str | None) -> str:
+        if not name:
+            return "Error: name is required for mcp_remove"
+        servers = self._load_mcp_config()
+        if name not in servers:
+            return f"Error: MCP server '{name}' not found"
+        del servers[name]
+        self._save_mcp_config(servers)
+        result = self._mcp_reload()
+        return f"Removed MCP server: {name}\n{result}"
+
+    def _mcp_reload(self) -> str:
+        if not self._reload_mcp:
+            return "Error: MCP reload not available"
+        try:
+            report = self._reload_mcp()
+            loaded = report.get("loaded") or []
+            errors = report.get("errors") or []
+            lines = [f"MCP reloaded. servers={len(loaded)}, errors={len(errors)}"]
+            if loaded:
+                lines.append("Connected: " + ", ".join(loaded))
+            if errors:
+                lines.append("Errors: " + " | ".join(errors))
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error: MCP reload failed: {e}"
+
+    @staticmethod
+    def _mcp_template(name: str) -> str:
+        return f"""command: npx
+args:
+  - "-y"
+  - "@modelcontextprotocol/server-filesystem"
+  - "/path/to/directory"
+tool_timeout: 30"""
 
     def _tool_path(self, name: str | None) -> Path | str:
         if not name:

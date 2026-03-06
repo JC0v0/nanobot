@@ -28,3 +28,22 @@ This file documents non-obvious constraints and usage patterns.
 - Supported actions: `list`, `read`, `create`, `update`, `deprecate`, `reload`.
 - New tools must subclass `Tool` and expose valid name/description/parameters/execute.
 - Use `deprecate` to disable a tool file (renamed to `.disabled.py`) instead of deleting it.
+
+### MCP Server Management (mcp_* actions)
+
+- MCP servers are configured in `workspace/mcp_servers.yaml` (YAML format).
+- Supported actions:
+  - `mcp_list`: List configured MCP servers
+  - `mcp_add`: Add new MCP server (requires name and YAML config)
+  - `mcp_remove`: Remove MCP server
+  - `mcp_reload`: Reload MCP connections without restarting
+- Example YAML config:
+  ```yaml
+  my_server:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "/path/to/directory"
+    tool_timeout: 30
+  ```

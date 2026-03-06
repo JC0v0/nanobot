@@ -1,9 +1,9 @@
 """Enhanced memory store with graph and timeline support.
 
-This module provides GraphMemoryStore which combines:
-- LegacyMemoryStore (MEMORY.md + HISTORY.md)
+This module provides GraphMemoryStore which uses:
 - MemoryGraph (entities + relationships + facts)
 - Timeline (chronological events)
+- EntityExtractor (LLM-based extraction)
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from nanobot.agent.memory.base import MemoryStore
 from nanobot.agent.memory.extractor import EntityExtractor, _EXTRACT_ENTITIES_TOOL
 from nanobot.agent.memory.graph import (
     MemoryEntity,
@@ -21,7 +20,6 @@ from nanobot.agent.memory.graph import (
     MemoryGraph,
     MemoryRelationship,
 )
-from nanobot.agent.memory.store import LegacyMemoryStore, _SAVE_MEMORY_TOOL
 from nanobot.agent.memory.timeline import Timeline, TimelineEntry
 
 if TYPE_CHECKING:
@@ -29,21 +27,17 @@ if TYPE_CHECKING:
     from nanobot.session.store import Session
 
 
-class GraphMemoryStore(MemoryStore):
-    """Enhanced memory store combining legacy memory, graph, and timeline.
+class GraphMemoryStore:
+    """Enhanced memory store using graph-based memory.
 
-    This class maintains backward compatibility with MemoryStore while
-    adding graph-based memory capabilities.
+    Stores entities, relationships, facts, and timeline events.
+    No longer uses the legacy MEMORY.md + HISTORY.md approach.
     """
 
-    def __init__(self, workspace: Path, *, enable_graph: bool = False):
+    def __init__(self, workspace: Path, *, enable_graph: bool = True):
         self.workspace = workspace
         self.enable_graph = enable_graph
 
-        # Legacy memory (always present for backward compatibility)
-        self._legacy = LegacyMemoryStore(workspace)
-
-        # Graph and timeline (optional)
         self._graph: MemoryGraph | None = None
         self._timeline: Timeline | None = None
         self._extractor: EntityExtractor | None = None
@@ -57,56 +51,44 @@ class GraphMemoryStore(MemoryStore):
 
     @property
     def graph(self) -> MemoryGraph | None:
-        """Access the memory graph (if enabled)."""
         return self._graph
 
     @property
     def timeline(self) -> Timeline | None:
-        """Access the timeline (if enabled)."""
         return self._timeline
 
     def read_long_term(self) -> str:
-        """Read long-term memory from legacy store."""
-        return self._legacy.read_long_term()
+        return ""
 
     def write_long_term(self, content: str) -> None:
-        """Write long-term memory to legacy store."""
-        self._legacy.write_long_term(content)
+        pass
 
     def append_history(self, entry: str) -> None:
-        """Append to history log in legacy store."""
-        self._legacy.append_history(entry)
+        pass
 
     def get_memory_context(self) -> str:
         """Get formatted memory context including graph and timeline."""
+        if not self._graph and not self._timeline:
+            return ""
+
         parts = []
 
-        # Legacy memory first
-        legacy_context = self._legacy.get_memory_context()
-        if legacy_context:
-            parts.append(legacy_context)
-
-        # Add graph context if enabled
-        if self.enable_graph and self._graph and self._graph.entities:
+        if self._graph and self._graph.entities:
             graph_parts = []
 
-            # Add related entities (limit to 10 most recent/relevant)
             entities = list(self._graph.entities.values())[:10]
             if entities:
                 graph_parts.append("### Related Entities")
                 for entity in entities:
                     graph_parts.append(f"- `{entity.id}`: {entity.description}")
 
-            # Add recent timeline entries
             if self._timeline:
                 recent = self._timeline.get_recent(5)
                 if recent:
                     graph_parts.append("")
                     graph_parts.append("### Recent Timeline")
                     for entry in recent:
-                        graph_parts.append(
-                            f"[{entry.date_str} {entry.time_str}] {entry.title}"
-                        )
+                        graph_parts.append(f"[{entry.date_str} {entry.time_str}] {entry.title}")
 
             if graph_parts:
                 parts.append("## Memory Graph\n\n" + "\n".join(graph_parts))
@@ -122,30 +104,14 @@ class GraphMemoryStore(MemoryStore):
         archive_all: bool = False,
         memory_window: int = 10,
     ) -> bool:
-        """Consolidate old messages into memory.
+        """Consolidate old messages into memory graph.
 
-        This runs the legacy consolidation first, then optionally extracts
-        entities and updates the graph and timeline.
+        Extracts entities, relationships, facts, and timeline entries
+        from the conversation using LLM.
         """
-        # First run legacy consolidation
-        legacy_success = await self._legacy.consolidate(
-            session,
-            provider,
-            model,
-            archive_all=archive_all,
-            memory_window=memory_window,
-        )
+        if not self.enable_graph or not self._graph or not self._timeline or not self._extractor:
+            return True
 
-        # If graph is disabled, we're done
-        if (
-            not self.enable_graph
-            or not self._graph
-            or not self._timeline
-            or not self._extractor
-        ):
-            return legacy_success
-
-        # Extract entities if we have messages to process
         try:
             if archive_all:
                 old_messages = session.messages
@@ -161,9 +127,9 @@ class GraphMemoryStore(MemoryStore):
                 await self._extract_and_update_graph(old_messages, provider, model)
         except Exception as e:
             logger.warning("Failed to update memory graph: {}", e)
-            # Don't fail the whole consolidation if graph update fails
+            return False
 
-        return legacy_success
+        return True
 
     async def _extract_and_update_graph(
         self,
@@ -175,13 +141,11 @@ class GraphMemoryStore(MemoryStore):
         if not self._extractor or not self._graph or not self._timeline:
             return
 
-        # Use the extractor
         result = await self._extractor.extract_from_messages(messages, provider, model)
 
         if not result:
             return
 
-        # Parse and add entities
         for entity_data in result.get("entities", []):
             entity = MemoryEntity(
                 id=entity_data.get("id", ""),
@@ -193,7 +157,6 @@ class GraphMemoryStore(MemoryStore):
             if entity.id:
                 self._graph.add_entity(entity)
 
-        # Parse and add relationships
         for rel_data in result.get("relationships", []):
             rel = MemoryRelationship(
                 source=rel_data.get("source", ""),
@@ -204,7 +167,6 @@ class GraphMemoryStore(MemoryStore):
             if rel.source and rel.target:
                 self._graph.add_relationship(rel)
 
-        # Parse and add facts
         for fact_data in result.get("facts", []):
             fact = MemoryFact(
                 statement=fact_data.get("statement", ""),
@@ -214,7 +176,6 @@ class GraphMemoryStore(MemoryStore):
             if fact.statement:
                 self._graph.add_fact(fact)
 
-        # Parse and add timeline entry
         timeline_data = result.get("timeline_entry", {})
         if timeline_data:
             self._timeline.add_entry(
@@ -224,7 +185,6 @@ class GraphMemoryStore(MemoryStore):
                 tags=timeline_data.get("tags", []),
             )
 
-        # Save changes
         self._graph.save()
         self._timeline.save()
 

@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.memory import MemoryStore
+from nanobot.agent.memory.graph_store import GraphMemoryStore
 from nanobot.agent.skills import SkillsLoader
 
 
@@ -24,7 +24,7 @@ class ContextBuilder:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.memory = GraphMemoryStore(workspace, enable_graph=True)
         self.skills = SkillsLoader(workspace)
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
@@ -87,8 +87,8 @@ You are nanobot, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
+- Memory graph: {workspace_path}/memory/MEMORY_GRAPH.md
+- Timeline: {workspace_path}/memory/TIMELINE.md
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 - Custom tools: {workspace_path}/tools/{{tool-file}}.py
 
@@ -100,10 +100,6 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 - Do not assume a file or directory exists — use list_dir or read_file to verify.
 - After writing or editing a file, re-read it if accuracy matters.
 - If a tool call fails, analyze the error before retrying with a different approach.
-
-## Memory
-- Remember important facts: write to {workspace_path}/memory/MEMORY.md
-- Recall past events: grep {workspace_path}/memory/HISTORY.md
 
 ## Skill-First Evolution
 - Improve behavior through skills in {workspace_path}/skills/ before changing global prompts.
@@ -175,9 +171,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             messages.append(processed_msg)
 
         # Current message (with optional image attachments)
-        user_content = self._build_user_content(
-            current_message, media, image_detail="low"
-        )
+        user_content = self._build_user_content(current_message, media, image_detail="low")
         user_content = self._inject_runtime_context(user_content, channel, chat_id)
         messages.append({"role": "user", "content": user_content})
 
@@ -209,15 +203,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
                         # Use path from media field if available
                         if media_index < len(media_paths):
                             path = media_paths[media_index]
-                            new_content.append(
-                                {"type": "text", "text": f"[Image: {path}]"}
-                            )
+                            new_content.append({"type": "text", "text": f"[Image: {path}]"})
                             media_index += 1
                         else:
                             # No path available, just note that an image was present
-                            new_content.append(
-                                {"type": "text", "text": "[Image: previously sent]"}
-                            )
+                            new_content.append({"type": "text", "text": "[Image: previously sent]"})
                     elif part_type in ("input_image", "input_video", "input_file"):
                         # VolcEngine format - also try to use media paths
                         if media_index < len(media_paths):

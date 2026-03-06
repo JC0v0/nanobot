@@ -1,23 +1,37 @@
-# Long-term Memory
+---
+version: "1.0"
+last_updated: "2026-01-01T00:00:00"
+---
 
-This file stores important information that should persist across sessions.
+# Memory Graph
 
-## User Information
+This file stores important information as a structured graph of entities and relationships.
+It is automatically maintained by nanobot through conversation analysis.
 
-(Important facts about the user)
+## Entities
 
-## Preferences
+### People
 
-(User preferences learned over time)
+### Projects
 
-## Project Context
+### Concepts
 
-(Information about ongoing projects)
+### Tools
 
-## Important Notes
-
-(Things to remember)
+## Relationships
 
 ---
 
-*This file is automatically updated by nanobot when important information should be remembered.*
+## Confirmed Facts
+
+- (Facts confirmed through conversation, with source attribution)
+
+---
+
+## Timeline
+
+See `TIMELINE.md` for chronological event history.
+
+---
+
+*This file is automatically updated by nanobot through LLM-based entity extraction from conversations.*

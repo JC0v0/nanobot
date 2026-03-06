@@ -1,19 +1,14 @@
 """Memory system module for nanobot.
 
-This module provides memory management for the agent, including:
-- LegacyMemoryStore: Original two-layer memory (MEMORY.md + HISTORY.md)
+This module provides graph-based memory management:
+- GraphMemoryStore: Enhanced memory store with graph and timeline
 - MemoryGraph: Structured entity-relationship graph
 - Timeline: Chronological event timeline
-- GraphMemoryStore: Enhanced memory store combining all of the above
 - EntityExtractor: LLM-based entity/relationship extraction
 - MemoryRetriever: Abstract and rule-based retrievers
 - ContextLinker: Builds graph context for queries
-
-For backward compatibility, the default export is still LegacyMemoryStore
-under the name 'MemoryStore'.
 """
 
-from nanobot.agent.memory.base import MemoryStore
 from nanobot.agent.memory.extractor import EntityExtractor, _EXTRACT_ENTITIES_TOOL
 from nanobot.agent.memory.graph import (
     MemoryEntity,
@@ -29,19 +24,10 @@ from nanobot.agent.memory.retriever import (
     RetrievalResult,
     RuleBasedRetriever,
 )
-from nanobot.agent.memory.store import LegacyMemoryStore, _SAVE_MEMORY_TOOL
 from nanobot.agent.memory.timeline import Timeline, TimelineEntry
 
-# Backward compatibility: export LegacyMemoryStore as MemoryStore
-# This ensures existing code continues to work without modification
-MemoryStore = LegacyMemoryStore
-
 __all__ = [
-    # Base interface
-    "MemoryStore",
-    # Legacy implementation (backward compatible default)
-    "LegacyMemoryStore",
-    # Enhanced memory store with graph
+    # Main store
     "GraphMemoryStore",
     # Entity extractor
     "EntityExtractor",
@@ -61,6 +47,5 @@ __all__ = [
     "Timeline",
     "TimelineEntry",
     # Internal
-    "_SAVE_MEMORY_TOOL",
     "_EXTRACT_ENTITIES_TOOL",
 ]
